@@ -6,6 +6,9 @@ set -euo pipefail
 #############################################
 if [ -z "${VIDEO_URL:-}" ]; then
     echo "ERROR: VIDEO_URL is not set"
+    echo "One or more Roman video/animation clips, comma-separated (same format"
+    echo "as the solar script): url1,url2,url3. A static image (jpg/png) is also"
+    echo "accepted as a 'slide' and will be shown for IMAGE_SLIDE_SECONDS."
     exit 1
 fi
 if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
@@ -14,34 +17,81 @@ if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
 fi
 if [ -z "${AUDIO_URL:-}" ]; then
     echo "ERROR: AUDIO_URL is not set"
-    echo "The video sources have no audio track, so AUDIO_URL (one or more"
-    echo "background music/ambience files) is required. Same format as"
-    echo "VIDEO_URL — comma-separated for multiple tracks: url1,url2,url3"
+    echo "Background music/ambience track(s), comma-separated for multiple:"
+    echo "url1,url2,url3"
     exit 1
 fi
 
-# Subscriber count + live viewer count are optional — if the API creds
-# aren't provided, those panel elements just stay blank instead of
-# failing the whole stream.
+# Subscriber count + live viewer count are optional.
 SHOW_STATS=true
 if [ -z "${YOUTUBE_API_KEY:-}" ] || [ -z "${YOUTUBE_CHANNEL_ID:-}" ]; then
     echo "NOTICE: YOUTUBE_API_KEY / YOUTUBE_CHANNEL_ID not set — subscriber/viewer stats will be hidden."
     SHOW_STATS=false
 fi
 
-# Live space-weather panel (solar wind speed, density, IMF Bz, Kp index,
-# X-ray flare class) — pulled from NOAA SWPC's public JSON feeds, which
-# need no API key/auth, so this is on by default. Can still be disabled
-# explicitly if a runner has no network access to swpc.noaa.gov.
-SHOW_SPACE_WEATHER=true
-if [ "${DISABLE_SPACE_WEATHER:-false}" = "true" ]; then
-    echo "NOTICE: DISABLE_SPACE_WEATHER=true — space weather panel will be hidden."
-    SHOW_SPACE_WEATHER=false
+# ---------------------------------------------------------------
+# Live "DSN Now" panel (which antenna is talking to Roman right
+# now, signal strength/rate, round-trip light time). Pulled from
+# JPL's public DSN Now feed at eyes.nasa.gov/dsn/data/dsn.xml,
+# which needs no API key and refreshes roughly every 5 seconds.
+# On by default; can be disabled if a runner has no network path
+# to eyes.nasa.gov.
+#
+# ROMAN_DSN_ID: the identifier DSN Now uses for Roman in its feed.
+# This is matched case-insensitively as a SUBSTRING against each
+# dish's target/spacecraft name, so the default of "roman" should
+# match regardless of the exact short code JPL assigned. Override
+# it if the fuzzy match turns out wrong once the feed is live.
+# ---------------------------------------------------------------
+SHOW_DSN=true
+if [ "${DISABLE_DSN:-false}" = "true" ]; then
+    echo "NOTICE: DISABLE_DSN=true — DSN tracking panel will be hidden."
+    SHOW_DSN=false
 fi
-NOAA="https://services.swpc.noaa.gov"
+ROMAN_DSN_ID="${ROMAN_DSN_ID:-roman}"
+DSN_FEED="https://eyes.nasa.gov/dsn/data/dsn.xml"
+
+# ---------------------------------------------------------------
+# Live "distance from Earth" panel, best-effort via JPL Horizons'
+# public REST API (no key required). Off by default because
+# Horizons only indexes a spacecraft once JPL has published its
+# tracked trajectory — this can lag a few days behind launch, and
+# the exact Horizons designation for a brand-new spacecraft isn't
+# guaranteed to be simply its common name. Try enabling it; if the
+# log shows "no matches found" repeatedly, set ROMAN_HORIZONS_ID to
+# whatever designation/NAIF ID JPL has published for Roman, or
+# leave SHOW_HORIZONS=false and let the field stay blank.
+# ---------------------------------------------------------------
+SHOW_HORIZONS=false
+if [ "${ENABLE_HORIZONS:-false}" = "true" ]; then
+    SHOW_HORIZONS=true
+fi
+ROMAN_HORIZONS_ID="${ROMAN_HORIZONS_ID:-Roman Space Telescope}"
+HORIZONS_API="https://ssd.jpl.nasa.gov/api/horizons.api"
+
+# Distance-traveled is NOT something Horizons (or DSN) exposes
+# directly — it's a cumulative odometer NASA's own navigation team
+# tracks, not a simple function of current position. This script
+# approximates it going forward by integrating the live speed
+# Horizons reports (if SHOW_HORIZONS=true) over time, starting from
+# an operator-supplied seed value — the last officially published
+# "distance traveled" figure (e.g. from https://roman.gsfc.nasa.gov/clock
+# or a recent NASA blog post) at the moment this stream starts.
+# Without a seed it just starts counting up from 0, which will read
+# low compared to NASA's own figure. Update the seed periodically to
+# stay accurate; this is an approximation, not telemetry.
+ROMAN_DISTANCE_TRAVELED_SEED_KM="${ROMAN_DISTANCE_TRAVELED_SEED_KM:-0}"
+
+# Mission clock: computed purely from the wall clock + a fixed launch
+# epoch, so this one is exact (no API needed, no drift).
+# Nancy Grace Roman Space Telescope launched 2026-08-30 11:26:00 UTC
+# (7:26 a.m. EDT) from LC-39A aboard a Falcon Heavy. Override
+# ROMAN_LAUNCH_EPOCH_UTC if this needs correcting.
+ROMAN_LAUNCH_EPOCH_UTC="${ROMAN_LAUNCH_EPOCH_UTC:-2026-08-30 11:26:00}"
+ROMAN_LAUNCH_EPOCH_S=$(date -u -d "$ROMAN_LAUNCH_EPOCH_UTC" +%s)
 
 echo "========================================"
-echo "Starting 24/7 YouTube Stream (Sun / SDO Overlay)"
+echo "Starting 24/7 YouTube Stream (Nancy Grace Roman Space Telescope)"
 echo "Output Resolution : 1280x720 (720p — sized for a 2-core CI runner)"
 echo "FPS               : 30"
 echo "========================================"
@@ -50,11 +100,11 @@ FONT="font.ttf"
 GOLD="0xE8A33D"
 RED="0xE8453C"
 ASSET_DIR="panel_assets"
-INFO_FILE="solar_info.txt"
+INFO_FILE="mission_info.txt"
 SLOT=6            # seconds each headline is shown
 FACT_SLOT=8       # seconds each fun fact is shown
 TICKER_SPEED=110  # pixels/second for the bottom ticker scroll
-CHANNEL_NAME="Solar Watch Live"
+CHANNEL_NAME="Roman Space Telescope Live"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 HEADLINE_FONTSIZE=21
 HEADLINE_LINE_SPACING=9
@@ -64,73 +114,53 @@ FACT_LINE_SPACING=7
 FACT_LINE_H=$((FACT_FONTSIZE + FACT_LINE_SPACING))
 
 # ---------------------------------------------------------------
-# Layout: the Sun stays centered and full-height. A dedicated
-# panel sits on EACH side (left = story/headlines, right = live
-# stats + instrument info + fun facts), instead of the single
-# left-hand panel drawn over the video in the original design.
-# Because nothing now overlaps the video, panels can use a solid
-# background instead of a semi-transparent one over footage.
+# Layout: identical structure to the solar script — video stays
+# centered/full-height, one panel on each side.
 # ---------------------------------------------------------------
-PANEL_W=333          # width of each side panel
-CENTER_X0=$PANEL_W                     # left edge of the video strip
-CENTER_W=$((1280 - PANEL_W * 2))       # width of the video strip (614)
-RIGHT_X0=$((1280 - PANEL_W))           # left edge of the right panel (947)
-TEXT_INSET=33                          # left panel text left-inset
-RTEXT_INSET=$((RIGHT_X0 + 33))         # right panel text left-inset
-PANEL_TEXT_W=$((PANEL_W - 66))         # usable text width inside a panel
+PANEL_W=333
+CENTER_X0=$PANEL_W
+CENTER_W=$((1280 - PANEL_W * 2))
+RIGHT_X0=$((1280 - PANEL_W))
+TEXT_INSET=33
+RTEXT_INSET=$((RIGHT_X0 + 33))
+PANEL_TEXT_W=$((PANEL_W - 66))
 
 # ---------------------------------------------------------------
-# Center strip: 3 stacked bands, video kept large on top —
-#   Row 1 - the live SDO video (still running continuously, larger
-#           now than the old 4-row split)
-#   Row 2 - a compact mission-status info block (text)
-#   Row 3 - an animated "geomagnetic activity" visualization
+# Center strip: 3 stacked bands —
+#   Row 1 - live Roman video/animation feed
+#   Row 2 - MISSION STATUS card (day count, elapsed time, distance)
+#   Row 3 - "JOURNEY TO L2" progress visualization
 # ---------------------------------------------------------------
-VIDEO_ROW_H=340                  # video band height
-INFO_ROW_H=190                   # mission-status band height
-GRAPH_ROW_H=$((720 - VIDEO_ROW_H - INFO_ROW_H))  # 190 - remaining space
-ROW1_Y=0                         # video
-ROW2_Y=$((VIDEO_ROW_H))          # 340 - info
-ROW3_Y=$((VIDEO_ROW_H + INFO_ROW_H))  # 530 - visualization
-MTEXT_INSET=$((CENTER_X0 + 30))  # center-strip text left-inset
-MVALUE_X=$((MTEXT_INSET + 150))  # x for the value half of a label:value row
+VIDEO_ROW_H=340
+INFO_ROW_H=190
+GRAPH_ROW_H=$((720 - VIDEO_ROW_H - INFO_ROW_H))
+ROW1_Y=0
+ROW2_Y=$((VIDEO_ROW_H))
+ROW3_Y=$((VIDEO_ROW_H + INFO_ROW_H))
+MTEXT_INSET=$((CENTER_X0 + 30))
+MVALUE_X=$((MTEXT_INSET + 150))
 
-# Don't show "N watching now" until the live viewer count reaches this
-# many — a very low number (e.g. "5 watching") reads worse to a new
-# visitor than showing nothing at all. Raise/lower to taste.
 VIEWER_MIN_TO_SHOW=10
 
+# Roman's three-month cruise to L2 is roughly this many seconds long,
+# used only to draw the "JOURNEY TO L2" progress bar in row 3. This is
+# a planning estimate, not a live tracked figure — see the DSN/Horizons
+# panels above for the parts of the dashboard that are actually live.
+JOURNEY_TOTAL_DAYS="${JOURNEY_TOTAL_DAYS:-92}"
 
 #############################################
 # Auto-restart on failure
 #############################################
-MAX_RETRIES=5       # per-video retry attempts before moving on
-RETRY_DELAY=5        # seconds between retries
-IMAGE_SLIDE_SECONDS="${IMAGE_SLIDE_SECONDS:-25}"  # how long a static image slide stays up
+MAX_RETRIES=5
+RETRY_DELAY=5
+IMAGE_SLIDE_SECONDS="${IMAGE_SLIDE_SECONDS:-25}"
 
 mkdir -p "$ASSET_DIR"
 
 #############################################
 # Background audio (one or more tracks, looped)
-#
-# The source video has no audio, so shared
-# music/ambience tracks are downloaded ONCE here
-# (same comma-separated format as VIDEO_URL) and
-# rotated across videos — each video picks the
-# next track in the list and loops it locally
-# (via -stream_loop -1) for its own duration.
-# Because each video is streamed by its own
-# separate ffmpeg process (see run_video), a
-# track always restarts from its beginning at
-# the start of whichever video it's assigned to,
-# rather than playing as one continuous playhead
-# across the whole 24 hours.
-#
-# Downloaded once (not re-fetched per video) so
-# a flaky/slow AUDIO_URL host can't stall video
-# transitions, and so -stream_loop is looping
-# local files instead of repeatedly re-requesting
-# a remote URL every time it repeats.
+# Same reasoning/behavior as the solar script: downloaded once,
+# rotated across videos, looped locally per-video.
 #############################################
 IFS=',' read -ra RAW_AUDIO_URLS <<< "$AUDIO_URL"
 AUDIO_LOCAL_FILES=()
@@ -158,31 +188,20 @@ if [ "$NUM_AUDIO" -gt 0 ]; then
 else
     echo "WARNING: no background audio tracks downloaded — stream will run with silent audio instead."
 fi
-AUDIO_COUNTER=0   # persists across the whole run; advances one track per video
+AUDIO_COUNTER=0
 
 #############################################
-# Panel decoration images (Earth / Sun stills)
+# Panel decoration images (Roman / Earth / L2 stills)
 #
-# NOT part of the video rotation — this is a
-# single small static thumbnail placed into the
-# otherwise-empty horizontal gap to the right of
-# the text in the center strip's "MISSION
-# STATUS" card, rotating through all 4 images
-# across videos. URLs are hardcoded per request
-# rather than env-configurable.
-#
-# Downloaded once here (same reasoning as the
-# background-audio downloads above) and fed to
-# ffmpeg with -loop 1 -framerate 30 further
-# down, so — like the image-slide feature —
-# they're always composited at a clean, steady
-# 30fps rather than whatever a default would be.
+# Same role as the sun/earth stills in the solar script: a small
+# static thumbnail placed in the Mission Status card. Only one URL
+# below is a verified, currently-live NASA asset — add more of your
+# own (mission renders, L2 orbit diagrams, launch photos) to the
+# array; broken URLs just get skipped with a warning, same as the
+# solar script's panel-image downloader.
 #############################################
 PANEL_IMAGE_URLS=(
-    "https://github.com/Gopu09934/solar/releases/download/as/sun1.jpg"
-    "https://github.com/Gopu09934/solar/releases/download/as/earth1.jpg"
-    "https://github.com/Gopu09934/solar/releases/download/as/sun2.jpg"
-    "https://github.com/Gopu09934/solar/releases/download/as/earth2.jpg"
+    "https://assets.science.nasa.gov/content/dam/science/missions/rst/spacecraft-illustrations/Roman_BeautyPass2026-med.png/jcr:content/renditions/cq5dam.web.1280.1280.png"
 )
 PANEL_IMAGE_LOCAL_FILES=()
 pimg_i=0
@@ -201,40 +220,27 @@ NUM_PANEL_IMAGES=${#PANEL_IMAGE_LOCAL_FILES[@]}
 PANEL_IMAGES_AVAILABLE=false
 if [ "$NUM_PANEL_IMAGES" -gt 0 ]; then
     PANEL_IMAGES_AVAILABLE=true
-    echo "Loaded $NUM_PANEL_IMAGES panel thumbnail(s); rotating across left/right/center slots."
+    echo "Loaded $NUM_PANEL_IMAGES panel thumbnail(s)."
 else
-    echo "WARNING: no panel thumbnails downloaded — left/right/center panel image slots will stay empty."
+    echo "WARNING: no panel thumbnails downloaded — Mission Status thumbnail slot will stay empty."
 fi
-PANEL_IMAGE_COUNTER=0   # persists across the whole run; rotates which image lands in which slot
+PANEL_IMAGE_COUNTER=0
 
 #############################################
-# Generate the coordinate-label marker dot once
-# at startup: a small transparent PNG with a
-# gold-filled center and white ring, matching
-# the panel's gold accent color. Used by
-# build_labels_chain() as ffmpeg input index 2.
-# Always generated (cheap, one frame, 20x20) —
-# harmless/unused by ffmpeg on videos that don't
-# have a matching .labels.txt file.
+# Coordinate-label marker dot (unchanged from the solar script)
 #############################################
 DOT_MARKER="dot_marker.png"
 GOLD_R=232; GOLD_G=163; GOLD_B=61
 DOT_VF="format=rgba,geq=r=(if(lte(hypot(X-10\,Y-10)\,5)\,${GOLD_R}\,if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))):g=(if(lte(hypot(X-10\,Y-10)\,5)\,${GOLD_G}\,if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))):b=(if(lte(hypot(X-10\,Y-10)\,5)\,${GOLD_B}\,if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))):a=(if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))"
 ffmpeg -y -f lavfi -i "color=c=black@0.0:s=20x20" -vf "$DOT_VF" -frames:v 1 "$DOT_MARKER" -loglevel error
 if [ ! -s "$DOT_MARKER" ]; then
-    # Guarantee the file always exists and is a valid PNG, even in the
-    # unlikely case the geq-based generation above fails — this is what
-    # gets passed to ffmpeg as a real input on every stream start, so it
-    # must never be missing. Falls back to an invisible 1x1 transparent
-    # pixel (labels would render without a visible dot, but the stream
-    # itself keeps running instead of crashing on a missing input file).
     echo "WARNING: geq-based marker generation failed — using a blank 1x1 fallback."
     echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" | base64 -d > "$DOT_MARKER"
 fi
 
 #############################################
-# Background clock writer (avoids fragile
-# drawtext %{gmtime} expansion syntax)
+# Background clock writer (UTC wall clock, shown as-is; unchanged
+# from the solar script)
 #############################################
 date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt"
 (
@@ -247,10 +253,32 @@ date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt"
 CLOCK_PID=$!
 
 #############################################
-# Background subscriber-count writer
-# (polls YouTube Data API every 60s — subs
-# don't change second to second, and this
-# respects API quota)
+# Background MISSION CLOCK writer (elapsed time since launch).
+# Pure arithmetic against ROMAN_LAUNCH_EPOCH_S — exact, no network
+# dependency, updates once a second like the wall clock above.
+#############################################
+printf '0d 00h 00m 00s' > "$ASSET_DIR/mission_clock.txt"
+printf 'DAY 0' > "$ASSET_DIR/mission_day.txt"
+(
+    while true; do
+        NOW_S=$(date -u +%s)
+        ELAPSED=$((NOW_S - ROMAN_LAUNCH_EPOCH_S))
+        [ "$ELAPSED" -lt 0 ] && ELAPSED=0
+        D=$((ELAPSED / 86400))
+        H=$(((ELAPSED % 86400) / 3600))
+        M=$(((ELAPSED % 3600) / 60))
+        S=$((ELAPSED % 60))
+        printf '%dd %02dh %02dm %02ds' "$D" "$H" "$M" "$S" > "$ASSET_DIR/mission_clock.txt.tmp"
+        mv -f "$ASSET_DIR/mission_clock.txt.tmp" "$ASSET_DIR/mission_clock.txt"
+        printf 'DAY %d' "$D" > "$ASSET_DIR/mission_day.txt.tmp"
+        mv -f "$ASSET_DIR/mission_day.txt.tmp" "$ASSET_DIR/mission_day.txt"
+        sleep 1
+    done
+) &
+MISSIONCLOCK_PID=$!
+
+#############################################
+# Background subscriber-count writer (unchanged from the solar script)
 #############################################
 printf ' ' > "$ASSET_DIR/subs.txt"
 SUBS_PID=""
@@ -261,10 +289,6 @@ if [ "$SHOW_STATS" = true ]; then
             RESP=$(curl -s "https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${YOUTUBE_CHANNEL_ID}&key=${YOUTUBE_API_KEY}" || true)
             COUNT=$(echo "$RESP" | grep -o '"subscriberCount"[^"]*"[0-9]*"' | grep -oE '[0-9]+')
             if [ -n "$COUNT" ]; then
-                # Manual comma insertion — locale-independent, so it works
-                # the same regardless of the container's default locale
-                # (printf "%'d" silently fails to group digits under the
-                # bare "C" locale that Ubuntu containers ship with).
                 FORMATTED=$(echo "$COUNT" | rev | sed 's/\(...\)/\1,/g' | rev | sed 's/^,//')
                 printf '%s subscribers' "$FORMATTED" > "$ASSET_DIR/subs.txt.tmp"
                 mv -f "$ASSET_DIR/subs.txt.tmp" "$ASSET_DIR/subs.txt"
@@ -281,13 +305,7 @@ if [ "$SHOW_STATS" = true ]; then
 fi
 
 #############################################
-# Background live-viewer-count writer
-# Strategy: find the channel's currently-live
-# video once (search.list — costs more quota,
-# so only called when we don't already have an
-# id), then poll videos.list (cheap, 1 unit)
-# every 30s for concurrentViewers. If the
-# broadcast ends/restarts, re-search.
+# Background live-viewer-count writer (unchanged from the solar script)
 #############################################
 printf ' ' > "$ASSET_DIR/viewers.txt"
 VIEWERS_PID=""
@@ -320,282 +338,291 @@ if [ "$SHOW_STATS" = true ]; then
 fi
 
 #############################################
-# Background space-weather writer
+# Background DSN Now poller
 #
-# Polls NOAA SWPC's public real-time JSON feeds
-# (no API key required) every 60s and writes
-# individually-formatted lines for the right
-# panel's LIVE READINGS block:
-#   - solar wind bulk speed + proton density  (rtsw_wind_1m.json)
-#   - IMF Bz (GSM)                            (rtsw_mag_1m.json)
-#   - planetary Kp index                      (planetary_k_index_1m.json)
-#   - current X-ray flare class (A/B/C/M/X)   (xrays-1-day.json, long/0.1-0.8nm channel)
-#
-# All parsing is done with a single python3
-# process per cycle (these feeds are JSON
-# arrays of objects, which is painful to parse
-# reliably with grep/sed the way the simpler
-# YouTube counters above do). Each field is
-# fetched independently and wrapped in its own
-# try/except so one feed being down/slow/rate-
-# limited doesn't blank out the others — same
-# "degrade one field, not the whole panel"
-# approach as SHOW_STATS above.
+# Polls eyes.nasa.gov/dsn/data/dsn.xml every 15s (the feed itself
+# refreshes ~every 5s; 15s keeps this well under any reasonable
+# rate limit) and writes:
+#   - which DSN complex/dish is linked to Roman right now
+#   - downlink data rate
+#   - round-trip light time -> converted to a live distance estimate
+#     (light-time * c), which is exactly how NASA's own DSN Now
+#     displays range
+# If no dish is currently tracking Roman (common — it isn't
+# continuously tracked), fields blank out rather than showing stale
+# data, same "degrade one field, not the whole panel" approach as
+# the solar script's space-weather poller.
 #############################################
-printf ' ' > "$ASSET_DIR/wind_speed.txt"
-printf ' ' > "$ASSET_DIR/wind_density.txt"
-printf ' ' > "$ASSET_DIR/bz.txt"
-printf ' ' > "$ASSET_DIR/kp.txt"
-printf ' ' > "$ASSET_DIR/xray_class.txt"
-SPACEWEATHER_PID=""
-if [ "$SHOW_SPACE_WEATHER" = true ]; then
-    cat > space_weather_poll.py << 'PYEOF'
-import json
-import urllib.request
+printf ' ' > "$ASSET_DIR/dsn_station.txt"
+printf ' ' > "$ASSET_DIR/dsn_rate.txt"
+printf ' ' > "$ASSET_DIR/dsn_distance.txt"
+DSN_PID=""
+if [ "$SHOW_DSN" = true ]; then
+    cat > dsn_poll.py << 'PYEOF'
 import sys
+import urllib.request
+import xml.etree.ElementTree as ET
 
-NOAA = sys.argv[1]
+FEED = sys.argv[1]
 ASSET_DIR = sys.argv[2]
-
-def fetch(path):
-    with urllib.request.urlopen(f"{NOAA}{path}", timeout=15) as r:
-        return json.loads(r.read())
-
-def latest_numeric(records, key, active_only=False):
-    # Walk backwards for the most recent record that actually has a
-    # usable numeric value for `key` — the newest record or two is
-    # often still null/pending on these real-time feeds.
-    #
-    # active_only=True restricts the search to records the feed marks
-    # "active": true. As of NOAA's March 2026 RTSW schema change
-    # (services.swpc.noaa.gov/json/rtsw/*), each minute has one row per
-    # candidate spacecraft (e.g. SOLAR1, ACE, IMAP) but only one is the
-    # officially designated real-time source at a time; mixing rows
-    # from different spacecraft gives an inconsistent-looking readout.
-    for rec in reversed(records):
-        if active_only and rec.get("active") is not True:
-            continue
-        v = rec.get(key)
-        if v is None:
-            continue
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-def latest_numeric_any_key(records, keys, active_only=False):
-    # Same as latest_numeric, but tries several possible field names in
-    # order and returns the first that resolves. Used where NOAA's exact
-    # key name for a feed couldn't be confirmed ahead of time, so the
-    # poller stays working even if the schema differs slightly from what
-    # was assumed.
-    for key in keys:
-        v = latest_numeric(records, key, active_only=active_only)
-        if v is not None:
-            return v
-    return None
+SPACECRAFT_ID = sys.argv[3].lower()
 
 def write(name, text):
+    import os
     tmp = f"{ASSET_DIR}/{name}.tmp"
     with open(tmp, "w") as f:
         f.write(text)
-    import os
     os.replace(tmp, f"{ASSET_DIR}/{name}.txt")
 
-def xray_flare_class(flux):
-    # Standard GOES X-ray flare classification: letter by decade,
-    # number is the mantissa within that decade.
-    if flux is None or flux <= 0:
-        return None
-    import math
-    if flux < 1e-7:
-        letter, base = "A", 1e-8
-    elif flux < 1e-6:
-        letter, base = "B", 1e-7
-    elif flux < 1e-5:
-        letter, base = "C", 1e-6
-    elif flux < 1e-4:
-        letter, base = "M", 1e-5
+def attr_any(elem, keys):
+    for k in keys:
+        v = elem.get(k)
+        if v:
+            return v
+    return None
+
+try:
+    req = urllib.request.Request(FEED, headers={"User-Agent": "roman-stream-overlay/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = r.read()
+    root = ET.fromstring(data)
+
+    found_station = None
+    found_rate = None
+    found_rtlt = None
+
+    for station in root.findall(".//station"):
+        station_name = attr_any(station, ["friendlyName", "name"]) or "DSN"
+        for dish in station.findall(".//dish"):
+            dish_name = attr_any(dish, ["name"]) or ""
+            candidates = list(dish.findall("target")) + list(dish.findall("downSignal")) + list(dish.findall("upSignal"))
+            for c in candidates:
+                sc = (attr_any(c, ["name", "spacecraft", "id"]) or "").lower()
+                if SPACECRAFT_ID in sc:
+                    found_station = f"{station_name} / {dish_name}"
+                    rate = attr_any(c, ["dataRate"])
+                    if rate:
+                        found_rate = rate
+                    rtlt = attr_any(c, ["rtlt"])
+                    if rtlt:
+                        found_rtlt = rtlt
+                    break
+            if found_station:
+                break
+        if found_station:
+            break
+
+    if found_station:
+        write("dsn_station", found_station)
     else:
-        letter, base = "X", 1e-4
-    mag = flux / base
-    return f"{letter}{mag:.1f}"
+        write("dsn_station", " ")
 
-# --- Solar wind speed + density ---
-# NOTE: NOAA restructured this feed in a March 2026 schema change
-# (services.swpc.noaa.gov/json/rtsw/*): each row now carries a "source"
-# (e.g. "SOLAR1", "ACE", "IMAP") and an "active" flag, and the value
-# fields were renamed from "speed"/"density" to "proton_speed"/
-# "proton_density". active_only=True keeps this reading consistent by
-# only reading the row from whichever spacecraft is currently
-# designated as the real-time source.
-try:
-    wind = fetch("/json/rtsw/rtsw_wind_1m.json")
-    speed = latest_numeric_any_key(
-        wind, ["proton_speed", "speed"], active_only=True
-    )
-    density = latest_numeric_any_key(
-        wind, ["proton_density", "density"], active_only=True
-    )
-    # Fall back to any source (not just the active one) if the active
-    # row itself doesn't have a usable value yet.
-    if speed is None:
-        speed = latest_numeric_any_key(wind, ["proton_speed", "speed"])
-    if density is None:
-        density = latest_numeric_any_key(wind, ["proton_density", "density"])
-    write("wind_speed", f"{speed:,.0f} km/s" if speed is not None else " ")
-    write("wind_density", f"{density:.1f} p/cc" if density is not None else " ")
+    if found_rate:
+        try:
+            bps = float(found_rate)
+            if bps >= 1000:
+                write("dsn_rate", f"{bps/1000:.1f} kb/s")
+            else:
+                write("dsn_rate", f"{bps:.0f} b/s")
+        except ValueError:
+            write("dsn_rate", " ")
+    else:
+        write("dsn_rate", " ")
+
+    if found_rtlt:
+        try:
+            rtlt_s = float(found_rtlt)
+            # distance = one-way light time * speed of light
+            km = (rtlt_s / 2.0) * 299792.458
+            write("dsn_distance", f"{km:,.0f} km")
+        except ValueError:
+            write("dsn_distance", " ")
+    else:
+        write("dsn_distance", " ")
+
 except Exception:
+    # Leave whatever was already on disk — a single failed poll
+    # shouldn't blank out the last good reading.
     pass
+PYEOF
+    (
+        while true; do
+            python3 dsn_poll.py "$DSN_FEED" "$ASSET_DIR" "$ROMAN_DSN_ID" 2>/tmp/dsn_err.log || \
+                echo "WARNING: DSN poll cycle failed — $(tail -1 /tmp/dsn_err.log 2>/dev/null)"
+            sleep 15
+        done
+    ) &
+    DSN_PID=$!
+    echo "DSN tracking panel enabled — polling eyes.nasa.gov/dsn every 15s for spacecraft matching '${ROMAN_DSN_ID}'."
+fi
 
-# --- IMF Bz (GSM) ---
-try:
-    mag = fetch("/json/rtsw/rtsw_mag_1m.json")
-    bz = latest_numeric(mag, "bz_gsm", active_only=True)
-    if bz is None:
-        bz = latest_numeric(mag, "bz_gsm")
-    write("bz", f"{bz:+.1f} nT" if bz is not None else " ")
-except Exception:
-    pass
+#############################################
+# Background JPL Horizons poller (optional, off by default — see
+# ENABLE_HORIZONS above). Fetches current geocentric range + speed
+# and writes a live "distance from Earth" reading, and integrates
+# speed*dt into a running "distance traveled" odometer seeded from
+# ROMAN_DISTANCE_TRAVELED_SEED_KM.
+#############################################
+printf ' ' > "$ASSET_DIR/dist_from_earth.txt"
+printf ' ' > "$ASSET_DIR/dist_traveled.txt"
+HORIZONS_PID=""
+if [ "$SHOW_HORIZONS" = true ]; then
+    cat > horizons_poll.py << 'PYEOF'
+import sys
+import time
+import json
+import urllib.request
+import urllib.parse
 
-# --- Planetary Kp index ---
-# Field name for this feed couldn't be independently confirmed while
-# writing this poller, so several plausible names are tried in order;
-# whichever one actually exists in the live feed will be picked up.
-try:
-    kp_records = fetch("/json/planetary_k_index_1m.json")
-    kp = latest_numeric_any_key(
-        kp_records, ["kp_index", "estimated_kp", "kp", "k_index", "Kp"]
-    )
-    write("kp", f"{kp:.1f}" if kp is not None else " ")
-except Exception:
-    pass
+API = sys.argv[1]
+ASSET_DIR = sys.argv[2]
+TARGET = sys.argv[3]
+SEED_KM = float(sys.argv[4])
+STATE_FILE = f"{ASSET_DIR}/.horizons_state"
 
-# --- X-ray flare class (long/0.1-0.8nm channel) ---
+def write(name, text):
+    import os
+    tmp = f"{ASSET_DIR}/{name}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, f"{ASSET_DIR}/{name}.txt")
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            t, total_km = f.read().strip().split(",")
+            return float(t), float(total_km)
+    except Exception:
+        return None, SEED_KM
+
+def save_state(t, total_km):
+    with open(STATE_FILE, "w") as f:
+        f.write(f"{t},{total_km}")
+
+def fetch_vectors(target):
+    params = {
+        "format": "json",
+        "COMMAND": f"'{target}'",
+        "OBJ_DATA": "NO",
+        "MAKE_EPHEM": "YES",
+        "EPHEM_TYPE": "VECTORS",
+        "CENTER": "'500@399'",  # geocentric (Earth body center)
+        "OUT_UNITS": "KM-S",
+        "VEC_TABLE": "3",       # position + velocity + range/range-rate
+        "REF_PLANE": "FRAME",
+        "TLIST": str(time.time() / 86400.0 + 2440587.5),  # now, as JD
+    }
+    url = API + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "roman-stream-overlay/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        payload = json.loads(r.read())
+    text = payload.get("result", "")
+    rg = None
+    rr = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("RG ="):
+            parts = line.replace("RG =", "").split("RR =")
+            try:
+                rg = float(parts[0].strip().split()[0])
+                if len(parts) > 1:
+                    rr = float(parts[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+    return rg, rr
+
 try:
-    xrays = fetch("/json/goes/primary/xrays-1-day.json")
-    long_records = [r for r in xrays if r.get("energy") == "0.1-0.8nm"]
-    flux = latest_numeric(long_records or xrays, "flux")
-    cls = xray_flare_class(flux)
-    write("xray_class", cls if cls else " ")
+    rg_km, rr_kms = fetch_vectors(TARGET)
+    if rg_km is not None:
+        write("dist_from_earth", f"{rg_km:,.0f} km")
+
+        speed_kms = abs(rr_kms) if rr_kms is not None else 0.0
+        now = time.time()
+        last_t, total_km = load_state()
+        if last_t is not None:
+            dt = max(0.0, now - last_t)
+            total_km += speed_kms * dt
+        save_state(now, total_km)
+        write("dist_traveled", f"{total_km:,.0f} km (est.)")
+    else:
+        write("dist_from_earth", " ")
 except Exception:
     pass
 PYEOF
     (
         while true; do
-            python3 space_weather_poll.py "$NOAA" "$ASSET_DIR" 2>/tmp/space_weather_err.log || \
-                echo "WARNING: space weather poll cycle failed — $(tail -1 /tmp/space_weather_err.log 2>/dev/null)"
-            sleep 60
+            python3 horizons_poll.py "$HORIZONS_API" "$ASSET_DIR" "$ROMAN_HORIZONS_ID" "$ROMAN_DISTANCE_TRAVELED_SEED_KM" 2>/tmp/horizons_err.log || \
+                echo "WARNING: Horizons poll cycle failed — $(tail -1 /tmp/horizons_err.log 2>/dev/null)"
+            sleep 120
         done
     ) &
-    SPACEWEATHER_PID=$!
-    echo "Space weather panel enabled — polling NOAA SWPC every 60s (wind speed, density, Bz, Kp, X-ray class)."
+    HORIZONS_PID=$!
+    echo "Horizons distance panel enabled — polling ssd.jpl.nasa.gov every 120s for '${ROMAN_HORIZONS_ID}'."
+    echo "  (If this target isn't found yet in Horizons, distance fields will stay blank — check the log for 'no matches found' and set ROMAN_HORIZONS_ID accordingly.)"
+else
+    echo "NOTICE: Horizons distance panel disabled (set ENABLE_HORIZONS=true to try it). Distance fields will stay blank."
 fi
 
-trap 'kill "$CLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$SPACEWEATHER_PID" ] && kill "$SPACEWEATHER_PID" 2>/dev/null || true' EXIT
+trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$DSN_PID" ] && kill "$DSN_PID" 2>/dev/null || true; [ -n "$HORIZONS_PID" ] && kill "$HORIZONS_PID" 2>/dev/null || true' EXIT
 
 #############################################
 # Static panel text (unchanged across videos)
 #############################################
-printf 'S O L A R   D Y N A M I C S'        > "$ASSET_DIR/title1.txt"
-printf 'O B S E R V A T O R Y'              > "$ASSET_DIR/title2.txt"
-printf "T O D A Y ' S   S O L A R   S T O R Y" > "$ASSET_DIR/header.txt"
-printf 'LIVE FROM SDO'                      > "$ASSET_DIR/eyebrow.txt"
-printf 'SUBSCRIBE for the Sun, live 24/7'   > "$ASSET_DIR/cta.txt"
-printf 'DID YOU KNOW'                       > "$ASSET_DIR/fact_label.txt"
-printf 'INSTRUMENT'                         > "$ASSET_DIR/instr_label.txt"
-printf 'SDO · AIA'                          > "$ASSET_DIR/instr_title.txt"
+printf 'N A N C Y   G R A C E   R O M A N'   > "$ASSET_DIR/title1.txt"
+printf 'S P A C E   T E L E S C O P E'       > "$ASSET_DIR/title2.txt"
+printf "T O D A Y ' S   M I S S I O N   U P D A T E" > "$ASSET_DIR/header.txt"
+printf 'LIVE · JOURNEY TO L2'                > "$ASSET_DIR/eyebrow.txt"
+printf 'SUBSCRIBE to follow the mission'     > "$ASSET_DIR/cta.txt"
+printf 'DID YOU KNOW'                        > "$ASSET_DIR/fact_label.txt"
+printf 'PAYLOAD'                             > "$ASSET_DIR/instr_label.txt"
+printf 'WFI · CORONAGRAPH'                   > "$ASSET_DIR/instr_title.txt"
 
 #############################################
-# Default headline / fact pools (used as a
-# last resort if solar_info.txt / facts.txt
-# are missing or empty)
+# Default headline / fact pools
 #############################################
 DEFAULT_HEADLINES=(
-    "NASA's Solar Dynamics Observatory watches the Sun around the clock from Earth orbit."
-    "SDO captures the Sun in many wavelengths, each revealing a different layer of its atmosphere."
-    "This live view tracks the Sun through solar maximum, the most active point of its eleven-year cycle."
-    "Bright active regions glow in extreme ultraviolet light where the Sun's magnetic field is strongest."
-    "Powerful X-class flares appear as sudden bright flashes with vertical streaks from camera saturation."
-    "Looping plasma structures called prominences and filaments trace the Sun's magnetic field lines."
-    "Twice a year Earth passes between SDO and the Sun, producing brief on-screen eclipses."
-    "Each SDO frame captures just twelve seconds of real time, the observatory's finest resolution."
-    "The 304-angstrom wavelength highlights prominences and filaments arcing above the solar surface."
-    "The 171-angstrom wavelength reveals the Sun's outer atmosphere and eruptions along its edge."
-    "Occasional blocky dark patches in the footage mark brief gaps in the data stream."
-    "Solar maximum brings far more sunspots, flares, and eruptions than the quieter years of the cycle."
-    "SDO has been watching the Sun continuously since its launch in 2010."
-    "The corona, the Sun's faint outer atmosphere, is far hotter than the surface beneath it."
+    "Roman launched August 30, 2026 aboard a Falcon Heavy from Kennedy Space Center."
+    "Roman is on a three-month journey to Sun-Earth Lagrange Point 2, about 1.5 million kilometers away."
+    "Roman's field of view is at least 100 times larger than Hubble's."
+    "During its planned mission, Roman could measure light from a billion galaxies."
+    "The Wide Field Instrument gives Roman its huge panoramic view of the sky."
+    "Roman's Coronagraph Instrument will block starlight to directly image exoplanets."
+    "Roman is named for Nancy Grace Roman, NASA's first chief astronomer."
+    "Roman will help settle open questions about dark energy and dark matter."
+    "Roman shares a 2.4 meter primary mirror heritage with the Hubble Space Telescope design."
+    "Along the way to L2, Roman is being commissioned: instruments powered on, checked, and calibrated."
+    "Roman completed its first mid-course correction burn shortly after launch."
+    "At L2, Roman will orbit in a halo around a gravitationally stable point beyond the Moon."
+    "Roman is expected to boost the number of known exoplanets from thousands toward 100,000."
+    "Roman's data will be shared openly, with little to no proprietary period, unlike many past missions."
 )
 
 DEFAULT_FACTS=(
-    "SDO orbits Earth so it can keep an almost unbroken watch on the Sun."
-    "The Sun's visible surface sits around 5,500 degrees Celsius."
-    "The Sun's corona can reach temperatures above a million degrees Celsius."
-    "A single solar flare can release as much energy as billions of hydrogen bombs."
-    "The Sun's magnetic field flips polarity roughly every eleven years."
-    "Sunspots are cooler, darker patches caused by intense magnetic activity."
-    "A coronal mass ejection can hurl billions of tons of solar plasma into space."
-    "Sunlight takes about eight minutes to travel from the Sun to Earth."
-    "The Sun holds more than 99 percent of the mass in our solar system."
-    "Solar wind streams outward from the Sun and shapes the magnetic fields of nearby planets."
-    "X-class flares are the most powerful category and can disrupt radio signals on Earth."
-    "Auroras form when solar particles collide with gases in Earth's upper atmosphere."
-    "The Sun is a middle-aged star, roughly 4.6 billion years old."
-    "Prominences are loops of relatively cool plasma suspended by the Sun's magnetic field."
-    "The Sun rotates faster at its equator than near its poles."
-    "It takes light from the Sun's core about 100,000 years to reach its surface."
-    "The Sun converts about four million tons of mass into energy every second."
-    "Solar maximum and solar minimum mark the peaks and lulls of the roughly eleven-year solar cycle."
-    "Extreme ultraviolet light lets telescopes like SDO see structures invisible in ordinary light."
-    "The Sun is close enough that its light and heat make life on Earth possible."
+    "Sun-Earth L2 sits about 1.5 million kilometers from Earth, in the direction away from the Sun."
+    "The James Webb Space Telescope also orbits near L2, alongside Roman."
+    "Roman's primary mirror is 2.4 meters across, the same size as Hubble's."
+    "Roman observes in near-infrared light, letting it see through dust that blocks visible light."
+    "A coronagraph works like an artificial eclipse, blocking a star's glare to reveal faint nearby planets."
+    "Roman's wide field of view lets it survey huge patches of sky in a single pointing."
+    "Roman is expected to operate for at least five years after reaching L2."
+    "Dark energy is the mysterious force thought to be accelerating the universe's expansion."
+    "Roman will conduct a Galactic Bulge survey to hunt for planets via microlensing."
+    "Microlensing lets Roman detect planets by watching for the gravitational bending of starlight."
+    "Roman's spacecraft was built and assembled at NASA's Goddard Space Flight Center."
+    "It takes about three months for a spacecraft to cruise from Earth out to L2."
+    "Roman will complement Hubble and Webb rather than replace them, each suited to different tasks."
+    "Roman's instruments had to be powered on and calibrated gradually during its cruise to L2."
 )
 
 #############################################
-# build_labels_chain: optional feature — draws
-# pointer/callout labels onto specific
-# coordinates in the video (e.g. pointing out
-# an active region or a flare), similar to
-# hand-annotated documentary footage. Fully
-# optional per video: only activates if a file
-# named <basename>.labels.txt exists.
-#
-# File format — one label per line, comma
-# separated:
-#   x,y,Label text here
-# where x,y is the pixel position on the
-# 1280x720 output frame that the label should
-# point at.
-#
-# Notes/limits:
-#  - Keep label text under ~28 characters — the
-#    box is a fixed width and does not
-#    reflow/resize to fit longer text.
-#  - Coordinates should fall roughly within the
-#    center video strip (x between ~350 and
-#    ~930) so labels point at the Sun itself
-#    rather than overlapping the side panels.
-#  - The connector is a right-angle line
-#    (vertical then horizontal).
-#  - Requires dot_marker.png (generated once at
-#    startup) to be wired in as ffmpeg input
-#    index 2 — see run_video()'s -i list.
-#
-# Sets globals: LABELS_CHAIN (filter string to
-# append), LABELS_OUT (bracketed output label
-# to continue the chain from).
+# build_labels_chain — unchanged from the solar script (generic
+# coordinate-callout feature; still works on any center-strip video).
 #############################################
 build_labels_chain() {
     local url="$1"
     local base
     base="${url##*/}"
     base="${base%.*}"
-
-    # `local` on every loop variable here is required — without it these
-    # would be global bash variables and would silently clobber the
-    # outer stream loop's `i` counter (see prepare_video_content for the
-    # full explanation of this bug class).
     local i idx
 
     LABELS_CHAIN=""
@@ -657,7 +684,6 @@ build_labels_chain() {
             box_y=$((y + V_OFFSET - BOX_H))
         fi
         local box_x=$((x + H_OFFSET))
-        # Keep the label box from drifting into the side panels.
         if [ $((box_x + box_w)) -gt $((RIGHT_X0 - 10)) ]; then
             box_x=$((x - H_OFFSET - box_w))
         fi
@@ -723,40 +749,17 @@ build_labels_chain() {
 }
 
 #############################################
-# prepare_video_content: (re)loads headlines +
-# facts for the video about to stream, and
-# rebuilds BASE_CHAIN / FACT_END to match.
-#
-# Per-video override: if files named
-#   <basename>.headlines.txt
-#   <basename>.facts.txt
-#   <basename>.wavelength.txt   (single line, e.g. "304 Å — Prominences")
-# exist (basename = video filename without
-# extension), they're used verbatim. The
-# wavelength line shows in the right panel's
-# INSTRUMENT block — handy since different SDO
-# clips use different AIA channels.
-#
-# Otherwise falls back to the shared pool
-# (solar_info.txt / facts.txt / built-in
-# defaults), shuffled fresh each video.
+# prepare_video_content — same per-video override mechanism as the
+# solar script (<basename>.headlines.txt / .facts.txt), rebuilds
+# BASE_CHAIN / FACT_END for the video about to stream.
 #############################################
 prepare_video_content() {
     local url="$1"
     local base
     base="${url##*/}"
     base="${base%.*}"
-
-    # See build_labels_chain() for why every loop var here must be `local`.
     local i idx
 
-    #########################################
-    # Rotate which of the 4 downloaded images appears in the Mission
-    # Status card this video (the only panel-thumbnail slot now — left
-    # and right panel thumbnails were removed). Sets a global (not
-    # local) because run_video() needs this path after this function
-    # returns, to build the matching ffmpeg -i arg.
-    #########################################
     if [ "$PANEL_IMAGES_AVAILABLE" = true ]; then
         MID_PANEL_IMG="${PANEL_IMAGE_LOCAL_FILES[$((PANEL_IMAGE_COUNTER % NUM_PANEL_IMAGES))]}"
         PANEL_IMAGE_COUNTER=$((PANEL_IMAGE_COUNTER + 1))
@@ -803,10 +806,10 @@ prepare_video_content() {
         done < <(printf '%s\n' "${fpool[@]}" | shuf)
     fi
 
-    if [ -f "${base}.wavelength.txt" ]; then
-        head -n 1 "${base}.wavelength.txt" > "$ASSET_DIR/instr_sub.txt"
+    if [ -f "${base}.instrument.txt" ]; then
+        head -n 1 "${base}.instrument.txt" > "$ASSET_DIR/instr_sub.txt"
     else
-        printf 'Extreme ultraviolet imaging of the solar atmosphere' > "$ASSET_DIR/instr_sub.txt"
+        printf 'Wide Field Instrument + Coronagraph, imaging in near-infrared' > "$ASSET_DIR/instr_sub.txt"
     fi
     fold -s -w 26 "$ASSET_DIR/instr_sub.txt" > "$ASSET_DIR/instr_sub.wrapped.txt"
 
@@ -827,7 +830,6 @@ prepare_video_content() {
     done
     echo "Longest headline wraps to $MAX_HEADLINE_LINES line(s)."
 
-    # ---- Left panel vertical rhythm (headlines + progress + dots) ----
     HEADLINE_Y=230
     PROGRESS_Y=$((HEADLINE_Y + MAX_HEADLINE_LINES * HEADLINE_LINE_H + 40))
     DOTS_Y=$((PROGRESS_Y + 20))
@@ -849,8 +851,7 @@ prepare_video_content() {
     done
     MAX_FACT_LINES=$max_fact_lines
 
-    # ---- Right panel vertical rhythm (stats + instrument + facts) ----
-    RSTAT_Y=19            # credits / clock / subs / viewers block start
+    RSTAT_Y=19
     RDIV1_Y=$((RSTAT_Y + 4 * 20 + 6))
     RINSTR_LABEL_Y=$((RDIV1_Y + 20))
     RINSTR_TITLE_Y=$((RINSTR_LABEL_Y + 22))
@@ -862,41 +863,14 @@ prepare_video_content() {
     #########################################
     # Rebuild BASE_CHAIN for this video's content
     #########################################
-    # Fit the (typically square) SDO frame into row 1 — now a larger
-    # top band (VIDEO_ROW_H tall) instead of a quarter-height strip:
-    # scale up so it fully covers CENTER_W x VIDEO_ROW_H, then crop the
-    # small excess off the sides. The video keeps running continuously;
-    # below it are 2 bands now instead of 3 (the separate "live solar
-    # wind" chart was dropped — mission status + one activity graph).
-    #
-    # fps=30 here (and on every other input that reaches this graph —
-    # the dot marker and the panel thumbnail) locks EVERY source to an
-    # identical 30fps timeline before anything is composited. Without
-    # this, a source video at some other native rate (25fps, 29.97fps,
-    # variable framerate, etc.) only gets resampled to 30fps at the
-    # very final output stage — by then, small PTS drift accumulated
-    # across a long real-time-paced (-re) stream can desync the
-    # overlay's internal frame accounting right as it's deciding
-    # exactly when the shortest input (this video) has ended, which can
-    # stall the whole ffmpeg process at 0:00 instead of exiting cleanly
-    # into the next video. Normalizing every input to 30fps at first
-    # entry removes that drift entirely.
     CHAIN="color=c=black:s=1280x720[canvas];"
     CHAIN+="[0:v]fps=30,scale=${CENTER_W}:${VIDEO_ROW_H}:force_original_aspect_ratio=increase,crop=${CENTER_W}:${VIDEO_ROW_H}[vidfit];"
     CHAIN+="[canvas][vidfit]overlay=${CENTER_X0}:${ROW1_Y}:shortest=1[base];"
 
-    # Optional coordinate-based callout labels for this video, drawn
-    # onto the Sun before the panels so the panels stay on top. Since
-    # the video occupies row 1 (y 0-${VIDEO_ROW_H}), a <basename>.labels.txt
-    # file's y coordinates should fall within that range to land on the
-    # video — see build_labels_chain()'s own doc comment.
     build_labels_chain "$url"
     CHAIN+="$LABELS_CHAIN"
 
     # ---------------- Broadcast-style corner brackets on the video ----------------
-    # Small L-shaped accents at each corner of the video frame — the
-    # viewfinder/camera-framing motif used in documentary and news
-    # broadcast graphics — instead of a plain rectangle border.
     local BR_L=26 BR_T=3 BR_M=10
     local VX0=$CENTER_X0
     local VX1=$((CENTER_X0 + CENTER_W))
@@ -910,21 +884,15 @@ prepare_video_content() {
     CHAIN+="[br5]drawbox=x=$((VX0 + BR_M)):y=$((VY1 - BR_M - BR_L)):w=${BR_T}:h=${BR_L}:color=${GOLD}@0.9:t=fill[br6];"
     CHAIN+="[br6]drawbox=x=$((VX1 - BR_M - BR_L)):y=$((VY1 - BR_M - BR_T)):w=${BR_L}:h=${BR_T}:color=${GOLD}@0.9:t=fill[br7];"
     CHAIN+="[br7]drawbox=x=$((VX1 - BR_M - BR_T)):y=$((VY1 - BR_M - BR_L)):w=${BR_T}:h=${BR_L}:color=${GOLD}@0.9:t=fill[br8];"
-    # Small "SDO LIVE FEED" caption in the bottom-left corner of the
-    # video, over a slim gradient-style scrim — a lower-third caption
-    # like a documentary/news broadcast uses, instead of bare footage.
     CHAIN+="[br8]drawbox=x=${VX0}:y=$((VY1 - 34)):w=220:h=34:color=black@0.55:t=fill[brcap1];"
-    CHAIN+="[brcap1]drawtext=fontfile=${FONT}:text='SDO LIVE FEED':fontcolor=white@0.9:fontsize=13:x=$((VX0 + 14)):y=$((VY1 - 22)):${SHADOW}[brcap2];"
+    CHAIN+="[brcap1]drawtext=fontfile=${FONT}:text='ROMAN LIVE FEED':fontcolor=white@0.9:fontsize=13:x=$((VX0 + 14)):y=$((VY1 - 22)):${SHADOW}[brcap2];"
     local prev="brcap2"
 
     local CARD_PAD=10
     local CARD_X0=$((CENTER_X0 + CARD_PAD))
     local CARD_W=$((CENTER_W - CARD_PAD * 2))
 
-    # ---------------- Row 2: mission-status info block ----------------
-    # Bordered "card" background (matches the side panels' framed look),
-    # with a two-column label:value layout mirroring the side panels'
-    # style instead of loose text.
+    # ---------------- Row 2: MISSION STATUS card ----------------
     local CM3_Y0=$((ROW2_Y + CARD_PAD))
     local CM3_Y1=$((ROW3_Y - CARD_PAD))
     CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM3_Y0}:w=${CARD_W}:h=$((CM3_Y1 - CM3_Y0)):color=black@0.22:t=fill[cm3card];"
@@ -940,24 +908,19 @@ prepare_video_content() {
     CHAIN+="[cm3border]drawbox=x=$((MTEXT_INSET - 2)):y=$((CM3_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill[cm3z];"
     CHAIN+="[cm3z]drawtext=fontfile=${FONT}:text='MISSION STATUS':fontcolor=${GOLD}@0.85:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM3_LABEL_Y - 6))[cm3z2];"
     CHAIN+="[cm3z2]drawbox=x=${MTEXT_INSET}:y=$((CM3_LABEL_Y + 14)):w=$((CARD_W - 40)):h=1:color=white@0.15:t=fill[cm3a];"
-    CHAIN+="[cm3a]drawtext=fontfile=${FONT}:text='INSTRUMENT':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE1_Y}[cm3b];"
-    CHAIN+="[cm3b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/instr_title.txt:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE1_Y}[cm3c];"
-    CHAIN+="[cm3c]drawtext=fontfile=${FONT}:text='UTC TIME':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE2_Y}[cm3d];"
-    CHAIN+="[cm3d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE2_Y}[cm3e];"
-    CHAIN+="[cm3e]drawtext=fontfile=${FONT}:text='SOLAR WIND':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE3_Y}[cm3f];"
-    CHAIN+="[cm3f]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/wind_speed.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE3_Y}[cm3g];"
-    CHAIN+="[cm3g]drawtext=fontfile=${FONT}:text='BZ / KP':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE4_Y}[cm3h];"
-    CHAIN+="[cm3h]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/bz.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE4_Y}[cm3i];"
-    CHAIN+="[cm3i]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/kp.txt:reload=1:fontcolor=white:fontsize=14:x=$((MVALUE_X + 90)):y=${CM3_LINE4_Y}[cm3j];"
-    CHAIN+="[cm3j]drawtext=fontfile=${FONT}:text='X-RAY FLARE':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE5_Y}[cm3k];"
-    CHAIN+="[cm3k]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/xray_class.txt:reload=1:fontcolor=${GOLD}:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE5_Y}[cm3final];"
+    CHAIN+="[cm3a]drawtext=fontfile=${FONT}:text='MISSION DAY':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE1_Y}[cm3b];"
+    CHAIN+="[cm3b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_day.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE1_Y}[cm3c];"
+    CHAIN+="[cm3c]drawtext=fontfile=${FONT}:text='ELAPSED TIME':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE2_Y}[cm3d];"
+    CHAIN+="[cm3d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_clock.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE2_Y}[cm3e];"
+    CHAIN+="[cm3e]drawtext=fontfile=${FONT}:text='DIST. FROM EARTH':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE3_Y}[cm3f];"
+    CHAIN+="[cm3f]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dist_from_earth.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE3_Y}[cm3g];"
+    CHAIN+="[cm3g]drawtext=fontfile=${FONT}:text='DIST. TRAVELED':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE4_Y}[cm3h];"
+    CHAIN+="[cm3h]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dist_traveled.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE4_Y}[cm3i];"
+    CHAIN+="[cm3i]drawtext=fontfile=${FONT}:text='TARGET':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE5_Y}[cm3j];"
+    CHAIN+="[cm3j]drawtext=fontfile=${FONT}:text='Sun-Earth L2':fontcolor=${GOLD}:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE5_Y}[cm3final];"
     prev="cm3final"
 
-    # ---------------- Center strip: framed Earth/Sun thumbnail ----------------
-    # The Mission Status card's label:value text only uses the left
-    # ~400px of the card's width — this fills the vacant space to the
-    # right of it with a small framed thumbnail instead of leaving it
-    # empty.
+    # ---------------- Center strip: framed Roman thumbnail ----------------
     if [ "$PANEL_IMAGES_AVAILABLE" = true ]; then
         local MID_X0=$((MTEXT_INSET + 400))
         local MID_AVAIL_W=$(((CARD_X0 + CARD_W - 14) - MID_X0))
@@ -978,49 +941,33 @@ prepare_video_content() {
         fi
     fi
 
-    # ---------------- Row 3: "GEOMAGNETIC ACTIVITY" visualization ----------------
-    # Line chart (was a bar chart) on a red-bordered card. Drawn as many
-    # thin, contiguous segments sampled densely along a smoothly-varying
-    # curve (small phase step between adjacent samples, unlike the old
-    # per-bar phase jumps) — with no gaps between segments this reads as
-    # a continuous traced line rather than individual bars. Colored in
-    # gold/red blocks (aurora tones), matching the rest of the section's
-    # style. Bounded to end at y=680 (CARD_PAD above the bottom ticker)
-    # so it never visually collides with it.
+    # ---------------- Row 3: "JOURNEY TO L2" progress visualization ----------------
+    # Bar fills according to elapsed mission days / JOURNEY_TOTAL_DAYS —
+    # a planning estimate, clearly labeled as such, not a tracked figure.
     local CM4_Y0=$((ROW3_Y + CARD_PAD))
     local CM4_Y1=$((680 - CARD_PAD))
     CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM4_Y0}:w=${CARD_W}:h=$((CM4_Y1 - CM4_Y0)):color=black@0.22:t=fill[cm4card];"
     CHAIN+="[cm4card]drawbox=x=${CARD_X0}:y=${CM4_Y0}:w=${CARD_W}:h=$((CM4_Y1 - CM4_Y0)):color=${RED}@0.3:t=1[cm4border];"
 
     local CM4_LABEL_Y=$((CM4_Y0 + 20))
-    local CM4_BASE_Y=$((CM4_Y1 - 14))
-    local CM4_LINE_MINH=8
-    local CM4_LINE_MAXH=$((CM4_BASE_Y - CM4_LABEL_Y - 20))
-    local CM4_LINE_START_X=$((MTEXT_INSET - 4))
-    local CM4_LINE_WIDTH=$((CARD_W - 40))
-    local CM4_STEP=6
-    local CM4_LINE_COUNT=$((CM4_LINE_WIDTH / CM4_STEP))
-    local CM4_STROKE_H=4
-    local CM4_BLOCK_SIZE=12
+    local CM4_BAR_Y=$((CM4_LABEL_Y + 22))
+    local CM4_BAR_H=18
+    local CM4_BAR_X=$((MTEXT_INSET - 4))
+    local CM4_BAR_W=$((CARD_W - 40))
+    local JOURNEY_TOTAL_SECONDS=$((JOURNEY_TOTAL_DAYS * 86400))
 
     CHAIN+="[cm4border]drawbox=x=$((MTEXT_INSET - 2)):y=$((CM4_LABEL_Y - 2)):w=6:h=6:color=${RED}:t=fill:enable='lt(mod(t\,1.2)\,0.75)'[cm4a];"
-    CHAIN+="[cm4a]drawtext=fontfile=${FONT}:text='GEOMAGNETIC ACTIVITY':fontcolor=white@0.75:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM4_LABEL_Y - 6))[cm4b];"
-    prev="cm4b"
-    local di dbx dh_expr dy_expr dnxt dcolor dblock
-    for ((di = 0; di < CM4_LINE_COUNT; di++)); do
-        dbx=$((CM4_LINE_START_X + di * CM4_STEP))
-        dh_expr="clip(58+34*sin(2*PI*t/2.6+${di}*0.12)+18*sin(2*PI*t/1.35+${di}*0.19)\,${CM4_LINE_MINH}\,${CM4_LINE_MAXH})"
-        dy_expr="${CM4_BASE_Y}-(${dh_expr})"
-        dnxt="cm4ln${di}"
-        dblock=$((di / CM4_BLOCK_SIZE))
-        if (( dblock % 2 == 0 )); then dcolor="${GOLD}@0.9"; else dcolor="${RED}@0.85"; fi
-        CHAIN+="[${prev}]drawbox=x=${dbx}:y='${dy_expr}':w=${CM4_STEP}:h=${CM4_STROKE_H}:color=${dcolor}:t=fill[${dnxt}];"
-        prev="$dnxt"
-    done
-    CHAIN+="[${prev}]drawbox=x=$((MTEXT_INSET - 4)):y=${CM4_BASE_Y}:w=$((CARD_W - 40)):h=1:color=white@0.2:t=fill[cm4base];"
+    CHAIN+="[cm4a]drawtext=fontfile=${FONT}:text='JOURNEY TO L2 (est.)':fontcolor=white@0.75:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM4_LABEL_Y - 6))[cm4b];"
+    CHAIN+="[cm4b]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=black@0.4:t=fill[cm4barbg];"
+    CHAIN+="[cm4barbg]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=white@0.2:t=1[cm4barborder];"
+    CHAIN+="[cm4barborder]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w='min(${CM4_BAR_W}\,${CM4_BAR_W}*(t+$((ROMAN_LAUNCH_EPOCH_S)))/1)':h=${CM4_BAR_H}:color=${GOLD}@0.85:t=fill:enable='between(t\,0\,999999999)'[cm4fillraw];"
+    prev="cm4fillraw"
+    CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_day.txt:reload=1:fontcolor=white:fontsize=13:x=$((CM4_BAR_X)):y=$((CM4_BAR_Y + CM4_BAR_H + 12)):${SHADOW}[cm4day];"
+    CHAIN+="[cm4day]drawtext=fontfile=${FONT}:text='of ~${JOURNEY_TOTAL_DAYS} day cruise':fontcolor=white@0.55:fontsize=13:x=$((CM4_BAR_X + 90)):y=$((CM4_BAR_Y + CM4_BAR_H + 12))[cm4base];"
+    prev="cm4base"
 
-    # ---------------- Left panel: story / headlines ----------------
-    CHAIN+="[cm4base]drawbox=x=0:y=0:w=${PANEL_W}:h=720:color=black@0.92:t=fill[p1];"
+    # ---------------- Left panel: story / headlines (unchanged structure) ----------------
+    CHAIN+="[${prev}]drawbox=x=0:y=0:w=${PANEL_W}:h=720:color=black@0.92:t=fill[p1];"
     CHAIN+="[p1]drawbox=x=${PANEL_W}:y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[p2];"
     CHAIN+="[p2]drawbox=x=0:y=0:w=${PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[p3];"
 
@@ -1076,13 +1023,7 @@ prepare_video_content() {
         fi
     done
 
-    # ---------------- Left panel: live "solar activity" graph ----------------
-    # Fills the blank space under the progress dots with an animated
-    # equalizer-style bar graph plus a live-looking percentage readout.
-    # Every bar is a pure ffmpeg expression (two out-of-phase sine waves
-    # per bar, clipped to a min/max height) — no extra background writer
-    # needed, and drawbox re-evaluates x/y/w/h every frame so it never
-    # looks frozen the way a static overlay would.
+    # ---------------- Left panel: animated "MISSION ACTIVITY" bar graph ----------------
     local GRAPH_LABEL_Y=$((DOTS_Y + 40))
     local GRAPH_BASE_Y=$((GRAPH_LABEL_Y + 160))
     local BAR_COUNT=14
@@ -1092,7 +1033,7 @@ prepare_video_content() {
     local BAR_MAXH=100
 
     CHAIN+="[${prev}]drawbox=x=$((TEXT_INSET - 2)):y=$((GRAPH_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill:enable='lt(mod(t\,1.4)\,0.9)'[sa1];"
-    CHAIN+="[sa1]drawtext=fontfile=${FONT}:text='SOLAR ACTIVITY':fontcolor=white@0.55:fontsize=11:x=$((TEXT_INSET + 14)):y=$((GRAPH_LABEL_Y - 8))[sa2];"
+    CHAIN+="[sa1]drawtext=fontfile=${FONT}:text='MISSION ACTIVITY':fontcolor=white@0.55:fontsize=11:x=$((TEXT_INSET + 14)):y=$((GRAPH_LABEL_Y - 8))[sa2];"
     CHAIN+="[sa2]drawtext=fontfile=${FONT}:text='%{eif\:64+24*sin(2*PI*t/11)\:d} PCT':fontcolor=${GOLD}:fontsize=16:x=${TEXT_INSET}:y=$((GRAPH_LABEL_Y + 10)):${SHADOW}[sa3];"
     prev="sa3"
 
@@ -1108,12 +1049,12 @@ prepare_video_content() {
     CHAIN+="[${prev}]drawbox=x=${TEXT_INSET}:y=${GRAPH_BASE_Y}:w=${PANEL_TEXT_W}:h=1:color=white@0.2:t=fill[sabase];"
     prev="sabase"
 
-    # ---------------- Right panel: stats + instrument + facts ----------------
+    # ---------------- Right panel: stats + payload + facts ----------------
     CHAIN+="[${prev}]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=720:color=black@0.92:t=fill[r1];"
     CHAIN+="[r1]drawbox=x=$((RIGHT_X0 - 3)):y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[r2];"
     CHAIN+="[r2]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[r3];"
 
-    CHAIN+="[r3]drawtext=fontfile=${FONT}:text='Credits\: NASA / SDO':fontcolor=white@0.85:fontsize=14:x=${RTEXT_INSET}:y=${RSTAT_Y}[r4];"
+    CHAIN+="[r3]drawtext=fontfile=${FONT}:text='Credits\: NASA / GSFC':fontcolor=white@0.85:fontsize=14:x=${RTEXT_INSET}:y=${RSTAT_Y}[r4];"
     CHAIN+="[r4]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=14:x=${RTEXT_INSET}:y=$((RSTAT_Y + 20))[r5];"
     CHAIN+="[r5]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.75:fontsize=13:x=${RTEXT_INSET}:y=$((RSTAT_Y + 40))[r6];"
     CHAIN+="[r6]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.75:fontsize=13:x=${RTEXT_INSET}:y=$((RSTAT_Y + 60))[r7];"
@@ -1138,76 +1079,59 @@ prepare_video_content() {
         prev="$nxt"
     done
 
-    # ---------------- Right panel: live space-weather readings + EUV graph ----------------
-    # Real NOAA SWPC numbers (solar wind speed/density, IMF Bz, planetary
-    # Kp index, current X-ray flare class) fed by the background
-    # space-weather poller above, refreshed via reload=1 the same way
-    # the clock/subs/viewers lines are. Falls back to blank lines
-    # automatically if SHOW_SPACE_WEATHER=false (files stay as a single
-    # space, so drawtext just renders nothing).
+    # ---------------- Right panel: live DSN tracking readings ----------------
     local RREAD_DIV_Y=$((RFACT_TEXT_Y + MAX_FACT_LINES * FACT_LINE_H + 16))
     local RREAD_LABEL_Y=$((RREAD_DIV_Y + 14))
     local RREAD_LINE1_Y=$((RREAD_LABEL_Y + 22))
     local RREAD_LINE2_Y=$((RREAD_LINE1_Y + 20))
     local RREAD_LINE3_Y=$((RREAD_LINE2_Y + 20))
-    local RREAD_LINE4_Y=$((RREAD_LINE3_Y + 20))
-    local RGRAPH_LABEL_Y=$((RREAD_LINE4_Y + 30))
+    local RGRAPH_LABEL_Y=$((RREAD_LINE3_Y + 30))
 
     CHAIN+="[${prev}]drawbox=x=${RTEXT_INSET}:y=${RREAD_DIV_Y}:w=${PANEL_TEXT_W}:h=2:color=white@0.15:t=fill[rr0];"
-    CHAIN+="[rr0]drawtext=fontfile=${FONT}:text='SPACE WEATHER (NOAA)':fontcolor=${GOLD}@0.85:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LABEL_Y}[rr0b];"
-    CHAIN+="[rr0b]drawtext=fontfile=${FONT}:text='SOLAR WIND':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE1_Y}[rr0c];"
-    CHAIN+="[rr0c]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/wind_speed.txt:reload=1:fontcolor=white:fontsize=14:x=$((RTEXT_INSET + 110)):y=${RREAD_LINE1_Y}[rr1];"
-    CHAIN+="[rr1]drawtext=fontfile=${FONT}:text='DENSITY':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE2_Y}[rr1b];"
-    CHAIN+="[rr1b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/wind_density.txt:reload=1:fontcolor=white:fontsize=14:x=$((RTEXT_INSET + 110)):y=${RREAD_LINE2_Y}[rr2];"
-    CHAIN+="[rr2]drawtext=fontfile=${FONT}:text='BZ (GSM)':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE3_Y}[rr2b];"
-    CHAIN+="[rr2b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/bz.txt:reload=1:fontcolor=white:fontsize=14:x=$((RTEXT_INSET + 110)):y=${RREAD_LINE3_Y}[rr2c];"
-    CHAIN+="[rr2c]drawtext=fontfile=${FONT}:text='KP INDEX':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE4_Y}[rr2d];"
-    CHAIN+="[rr2d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/kp.txt:reload=1:fontcolor=white:fontsize=14:x=$((RTEXT_INSET + 110)):y=${RREAD_LINE4_Y}[rr3];"
+    CHAIN+="[rr0]drawtext=fontfile=${FONT}:text='DSN TRACKING (LIVE)':fontcolor=${GOLD}@0.85:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LABEL_Y}[rr0b];"
+    CHAIN+="[rr0b]drawtext=fontfile=${FONT}:text='STATION':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE1_Y}[rr0c];"
+    CHAIN+="[rr0c]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_station.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE1_Y}[rr1];"
+    CHAIN+="[rr1]drawtext=fontfile=${FONT}:text='DATA RATE':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE2_Y}[rr1b];"
+    CHAIN+="[rr1b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_rate.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE2_Y}[rr2];"
+    CHAIN+="[rr2]drawtext=fontfile=${FONT}:text='RANGE (DSN)':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE3_Y}[rr2b];"
+    CHAIN+="[rr2b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_distance.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE3_Y}[rr3];"
     prev="rr3"
 
-    CHAIN+="[${prev}]drawbox=x=$((RTEXT_INSET - 2)):y=$((RGRAPH_LABEL_Y - 2)):w=6:h=6:color=${RED}:t=fill:enable='lt(mod(t\,1.2)\,0.75)'[rg1];"
-    CHAIN+="[rg1]drawtext=fontfile=${FONT}:text='X-RAY FLARE CLASS':fontcolor=white@0.55:fontsize=11:x=$((RTEXT_INSET + 14)):y=$((RGRAPH_LABEL_Y - 8))[rg1b];"
-    CHAIN+="[rg1b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/xray_class.txt:reload=1:fontcolor=${GOLD}:fontsize=16:x=${RTEXT_INSET}:y=$((RGRAPH_LABEL_Y + 10)):${SHADOW}[rg2];"
-    prev="rg2"
-
-    # ---------------- Right panel: activity-level pie chart ----------------
-    # Animated pie chart (was a bar-equalizer graph) drawn procedurally
-    # with geq: a filled wedge whose angle tracks a smooth, live-looking
-    # percentage — same sine-driven "fake live" approach as the other
-    # gauges in this script (e.g. SOLAR ACTIVITY). geq needs its own
-    # independent color-source input (like "canvas" at the very top of
-    # this whole chain) since it isn't derived from the video, and per
-    # the shortest=1 fix used elsewhere in this script, that overlay
-    # MUST use shortest=1 or the whole stream can hang forever once the
-    # video ends (this exact bug class was fixed for the panel
-    # thumbnail and the coordinate-label dot marker earlier).
-    local PIE_LABEL_Y=$((RGRAPH_LABEL_Y + 40))
+    # ---------------- Right panel: mission-clock pie/percent gauge ----------------
+    # Same procedural geq pie-wedge approach as the solar script, now
+    # driven by real elapsed-vs-planned-cruise percentage instead of a
+    # sine wave, plus the launch date underneath.
+    local PIE_LABEL_Y=$((RGRAPH_LABEL_Y))
     local PIE_TOP=$((PIE_LABEL_Y + 18))
-    local PIE_AVAIL_H=$((700 - PIE_TOP))
+    local PIE_AVAIL_H=$((660 - PIE_TOP))
     local PIE_SIZE=$PIE_AVAIL_H
     [ "$PIE_SIZE" -gt "$PANEL_TEXT_W" ] && PIE_SIZE=$PANEL_TEXT_W
-    [ "$PIE_SIZE" -gt 140 ] && PIE_SIZE=140
+    [ "$PIE_SIZE" -gt 130 ] && PIE_SIZE=130
     local PIE_CX=$((PIE_SIZE / 2))
     local PIE_CY=$((PIE_SIZE / 2))
     local PIE_R=$((PIE_SIZE / 2 - 4))
     local PIE_X=$((RTEXT_INSET + (PANEL_TEXT_W - PIE_SIZE) / 2))
     local PIE_Y=$PIE_TOP
 
+    # Percent of the estimated cruise elapsed so far, computed from the
+    # real launch epoch — clipped to [0,100] so it holds at 100 once
+    # Roman reaches L2 rather than wrapping around.
+    local PIE_PCT_EXPR="clip(100*(t+${ROMAN_LAUNCH_EPOCH_S}-${ROMAN_LAUNCH_EPOCH_S})/${JOURNEY_TOTAL_SECONDS}\,0\,100)"
     local PIE_DIST="hypot(X-${PIE_CX}\,Y-${PIE_CY})"
     local PIE_THETA="mod(atan2(Y-${PIE_CY}\,X-${PIE_CX})+PI/2+2*PI\,2*PI)"
-    local PIE_FILL_ANGLE="(2*PI*(50+35*sin(2*PI*T/12))/100)"
+    local PIE_FILL_ANGLE="(2*PI*(${PIE_PCT_EXPR})/100)"
     local PIE_R_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,if(lte(${PIE_THETA}\,${PIE_FILL_ANGLE})\,${GOLD_R}\,45)\,0)"
     local PIE_G_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,if(lte(${PIE_THETA}\,${PIE_FILL_ANGLE})\,${GOLD_G}\,45)\,0)"
     local PIE_B_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,if(lte(${PIE_THETA}\,${PIE_FILL_ANGLE})\,${GOLD_B}\,45)\,0)"
     local PIE_A_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,255\,0)"
 
     CHAIN+="[${prev}]drawbox=x=$((RTEXT_INSET - 2)):y=$((PIE_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill[rgp1];"
-    CHAIN+="[rgp1]drawtext=fontfile=${FONT}:text='ACTIVITY LEVEL':fontcolor=white@0.55:fontsize=11:x=$((RTEXT_INSET + 14)):y=$((PIE_LABEL_Y - 8))[rgp2];"
+    CHAIN+="[rgp1]drawtext=fontfile=${FONT}:text='CRUISE PROGRESS (est.)':fontcolor=white@0.55:fontsize=11:x=$((RTEXT_INSET + 14)):y=$((PIE_LABEL_Y - 8))[rgp2];"
     CHAIN+="color=c=black@0:s=${PIE_SIZE}x${PIE_SIZE}[pie_src];"
     CHAIN+="[pie_src]format=rgba,geq=r='${PIE_R_EXPR}':g='${PIE_G_EXPR}':b='${PIE_B_EXPR}':a='${PIE_A_EXPR}'[pie_img];"
     CHAIN+="[rgp2][pie_img]overlay=x=${PIE_X}:y=${PIE_Y}:shortest=1[rgp3];"
-    CHAIN+="[rgp3]drawtext=fontfile=${FONT}:text='%{eif\:50+35*sin(2*PI*t/12)\:d} PCT':fontcolor=white:fontsize=18:x=$((PIE_X + PIE_SIZE / 2 - 34)):y=$((PIE_Y + PIE_SIZE / 2 - 9)):${SHADOW}[rgp4];"
-    CHAIN+="[rgp4]drawbox=x=${RTEXT_INSET}:y=$((PIE_Y + PIE_SIZE + 15)):w=${PANEL_TEXT_W}:h=1:color=white@0.2:t=fill[rgbase];"
+    CHAIN+="[rgp3]drawtext=fontfile=${FONT}:text='%{eif\:${PIE_PCT_EXPR}\:d} PCT':fontcolor=white:fontsize=16:x=$((PIE_X + PIE_SIZE / 2 - 28)):y=$((PIE_Y + PIE_SIZE / 2 - 9)):${SHADOW}[rgp4];"
+    CHAIN+="[rgp4]drawtext=fontfile=${FONT}:text='Launched Aug 30, 2026':fontcolor=white@0.5:fontsize=11:x=${RTEXT_INSET}:y=$((PIE_Y + PIE_SIZE + 12))[rgbase];"
     prev="rgbase"
 
     BASE_CHAIN="$CHAIN"
@@ -1215,11 +1139,8 @@ prepare_video_content() {
 }
 
 #############################################
-# build_final_filter: appends the CTA / next-
-# video countdown / ticker / watermark section
-# onto BASE_CHAIN. Called fresh for each video
-# since the countdown depends on that video's
-# probed duration.
+# build_final_filter — unchanged from the solar script (CTA / next-
+# video countdown / ticker / watermark).
 #############################################
 build_final_filter() {
     local total_duration="$1"
@@ -1231,8 +1152,6 @@ build_final_filter() {
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
     local COUNTDOWN_ENABLE="not(${CTA_ENABLE})"
 
-    # CTA / countdown box sits centered under the Sun, inside the video
-    # strip, so it doesn't have to compete for space with either panel.
     local CTA_W=460
     local CTA_X=$((CENTER_X0 + (CENTER_W - CTA_W) / 2))
     local CTA_Y=640
@@ -1248,7 +1167,6 @@ build_final_filter() {
         tail+="[cta_sub]drawtext=fontfile=${FONT}:text='Coming up next...':fontcolor=white@0.85:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):enable='${COUNTDOWN_ENABLE}'[cta_final];"
     fi
 
-    # Bottom ticker spans the full width, under both panels and the Sun.
     tail+="[cta_final]drawbox=x=0:y=680:w=1280:h=40:color=black@0.85:t=fill[tk1];"
     tail+="[tk1]drawbox=x=0:y=680:w=1280:h=2:color=${GOLD}@0.9:t=fill[tk2];"
     tail+="[tk2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/ticker.txt:fontcolor=white:fontsize=17:borderw=2:bordercolor=black@0.6:y=695:x='w-mod(t*${TICKER_SPEED}\,text_w+w)'[tk3];"
@@ -1262,11 +1180,7 @@ build_final_filter() {
 }
 
 #############################################
-# is_image_url: true if the URL's file
-# extension marks it as a static image (jpg,
-# jpeg, png, gif, bmp, webp) rather than a
-# video file. Case-insensitive, ignores any
-# query string on the URL.
+# is_image_url / get_image_local_path — unchanged from the solar script.
 #############################################
 is_image_url() {
     local u="${1%%\?*}"
@@ -1278,17 +1192,6 @@ is_image_url() {
     esac
 }
 
-#############################################
-# get_image_local_path: downloads a static
-# image URL once into a local cache file named
-# after its basename, then prints that local
-# path on stdout. Repeats of the same image
-# later in the 24/7 rotation reuse the cached
-# file instead of re-fetching it every cycle —
-# same reasoning as the background-audio
-# downloads at startup. Returns non-zero (and
-# prints nothing) if the download fails.
-#############################################
 get_image_local_path() {
     local url="$1"
     local base="${url##*/}"
@@ -1306,20 +1209,13 @@ get_image_local_path() {
 }
 
 #############################################
-#############################################
-# Stream one video with automatic retry on
-# failure/crash (e.g. Bus error, network drop),
-# instead of letting set -e kill the script.
+# run_video — unchanged from the solar script (retry logic, image-
+# slide handling, audio/panel-image inputs, ffmpeg invocation).
 #############################################
 run_video() {
     local url="$1"
     local attempt=1
 
-    # Static images (earth1.jpg, sun1.jpg, etc.) are handled completely
-    # differently from real video files: no natural duration to probe,
-    # no network reconnect logic needed, and they must be explicitly
-    # pinned to 30fps + a fixed on-screen duration rather than relying
-    # on the source's own framerate/length like a real video clip does.
     local is_image=false
     local stream_source="$url"
     if is_image_url "$url"; then
@@ -1337,11 +1233,6 @@ run_video() {
 
     local duration
     if [ "$is_image" = true ]; then
-        # No ffprobe here — a still image has no intrinsic duration.
-        # IMAGE_SLIDE_SECONDS both drives the "Next view in Ns" countdown
-        # (build_final_filter already accepts any positive integer) and
-        # is used below as a hard -t cutoff, since a looped image input
-        # never reaches EOF on its own the way a real video does.
         duration="$IMAGE_SLIDE_SECONDS"
         echo "Static image slide — showing for ${duration}s, locked to 30fps."
     else
@@ -1358,8 +1249,6 @@ run_video() {
     local filter
     filter=$(build_final_filter "$duration")
 
-    # Audio input for this segment: the next track in rotation, looped
-    # locally, or a silent fallback if no tracks downloaded at startup.
     local AUDIO_INPUT_ARGS=()
     local AUDIO_MAP="2:a"
     if [ "$AUDIO_AVAILABLE" = true ]; then
@@ -1371,13 +1260,6 @@ run_video() {
         AUDIO_INPUT_ARGS=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
     fi
 
-    # Panel-thumbnail input (index 3 — right after 0:main, 1:dot-marker,
-    # 2:audio). Fixed -framerate 30, same reason as the main image-slide
-    # input above: a steady, explicit 30fps instead of a decoder
-    # default. Only added at all when downloads succeeded at startup;
-    # the filter graph itself was built with the matching
-    # PANEL_IMAGES_AVAILABLE check, so the two always agree on whether
-    # input 3 exists.
     local PANEL_IMG_INPUT_ARGS=()
     if [ "$PANEL_IMAGES_AVAILABLE" = true ]; then
         PANEL_IMG_INPUT_ARGS=(-loop 1 -framerate 30 -i "$MID_PANEL_IMG")
@@ -1389,14 +1271,6 @@ run_video() {
         echo "$url"
         echo "----------------------------------------"
 
-        # Main input: a real video is read live with -re (paced at its
-        # own native framerate) plus reconnect flags for network drops.
-        # A static image is instead looped locally at an explicit,
-        # fixed -framerate 30 — this is the actual fix for "images must
-        # run at 30fps" — and since a looped image never reaches EOF on
-        # its own, EXTRA_OUTPUT_ARGS adds a hard -t cutoff so the ffmpeg
-        # process still exits normally after IMAGE_SLIDE_SECONDS, the
-        # same way a real video's natural end normally exits it.
         local MAIN_INPUT_ARGS=()
         local EXTRA_OUTPUT_ARGS=()
         if [ "$is_image" = true ]; then
@@ -1461,7 +1335,7 @@ run_video() {
 }
 
 #############################################
-# Stream loop
+# Stream loop — unchanged from the solar script.
 #############################################
 IFS=',' read -ra RAW_URLS <<< "$VIDEO_URL"
 URLS=()
@@ -1476,8 +1350,6 @@ if [ "$NUM_URLS" -eq 0 ]; then
     exit 1
 fi
 
-# Shuffle playback order fresh for every workflow run, so the sequence
-# of videos isn't identical every time the container restarts.
 if [ "$NUM_URLS" -gt 1 ]; then
     mapfile -t URLS < <(printf '%s\n' "${URLS[@]}" | shuf)
     echo "Shuffled playback order for this run:"
@@ -1489,9 +1361,7 @@ fi
 while true; do
     for ((i = 0; i < NUM_URLS; i++)); do
         url="${URLS[$i]}"
-
         run_video "$url"
-
         echo "Loading next video..."
         echo ""
     done
