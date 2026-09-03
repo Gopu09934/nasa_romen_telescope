@@ -780,7 +780,7 @@ trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/nul
 #############################################
 # Static panel text (unchanged across videos)
 #############################################
-printf 'N A N C Y   G R A C E   R O M A N'   > "$ASSET_DIR/title1.txt"
+printf 'N A N C Y   R O M A N'   > "$ASSET_DIR/title1.txt"
 printf 'S P A C E   T E L E S C O P E'       > "$ASSET_DIR/title2.txt"
 printf "T O D A Y ' S   M I S S I O N   U P D A T E" > "$ASSET_DIR/header.txt"
 printf 'LIVE · JOURNEY TO L2'                > "$ASSET_DIR/eyebrow.txt"
