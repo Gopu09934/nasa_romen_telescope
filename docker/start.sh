@@ -90,6 +90,34 @@ ROMAN_DISTANCE_TRAVELED_SEED_KM="${ROMAN_DISTANCE_TRAVELED_SEED_KM:-0}"
 ROMAN_LAUNCH_EPOCH_UTC="${ROMAN_LAUNCH_EPOCH_UTC:-2026-08-30 11:26:00}"
 ROMAN_LAUNCH_EPOCH_S=$(date -u -d "$ROMAN_LAUNCH_EPOCH_UTC" +%s)
 
+# ---------------------------------------------------------------
+# Feed label honesty: most 24/7 rotations like this are looping
+# animation/renders, not an actual continuous downlinked camera feed
+# (Roman doesn't have a public live camera the way SDO does). Default
+# to a label that doesn't overclaim; set VIDEO_FEED_LABEL="ROMAN LIVE
+# FEED" explicitly if VIDEO_URL genuinely is a live camera source.
+# ---------------------------------------------------------------
+VIDEO_FEED_LABEL="${VIDEO_FEED_LABEL:-MISSION ANIMATION}"
+
+# ---------------------------------------------------------------
+# Network-failure fallback: if a video URL can't even be reached
+# (not just "duration unknown" — genuinely unreachable), retrying it
+# 5 times burns MAX_RETRIES * RETRY_DELAY seconds of dead air. If
+# FALLBACK_IMAGE_URL is set, an unreachable video is skipped in favor
+# of streaming that image as a slide for this rotation instead, so
+# retries are only spent on videos that are actually there.
+# ---------------------------------------------------------------
+FALLBACK_IMAGE_URL="${FALLBACK_IMAGE_URL:-}"
+
+# ---------------------------------------------------------------
+# Optional operator override for the panel-thumbnail rotation, so
+# new mission photos/renders can be added as they're released
+# without editing this script — comma-separated, same format as
+# VIDEO_URL. Falls back to the single built-in verified image below
+# if unset.
+# ---------------------------------------------------------------
+ROMAN_PANEL_IMAGE_URLS="${ROMAN_PANEL_IMAGE_URLS:-}"
+
 echo "========================================"
 echo "Starting 24/7 YouTube Stream (Nancy Grace Roman Space Telescope)"
 echo "Output Resolution : 1280x720 (720p — sized for a 2-core CI runner)"
@@ -201,17 +229,25 @@ AUDIO_COUNTER=0
 #
 # Same role as the sun/earth stills in the solar script: a small
 # static thumbnail placed in the Mission Status card. Only one URL
-# below is a verified, currently-live NASA asset — add more of your
-# own (mission renders, L2 orbit diagrams, launch photos) to the
-# array; broken URLs just get skipped with a warning, same as the
-# solar script's panel-image downloader.
+# below is a verified, currently-live NASA asset — pass more of your
+# own (mission renders, L2 orbit diagrams, launch photos) via
+# ROMAN_PANEL_IMAGE_URLS (comma-separated) as new ones are released,
+# without editing this script. Broken URLs just get skipped with a
+# warning, same as the solar script's panel-image downloader.
 #############################################
-PANEL_IMAGE_URLS=(
-    "https://assets.science.nasa.gov/content/dam/science/missions/rst/spacecraft-illustrations/Roman_BeautyPass2026-med.png/jcr:content/renditions/cq5dam.web.1280.1280.png"
-)
+if [ -n "$ROMAN_PANEL_IMAGE_URLS" ]; then
+    IFS=',' read -ra PANEL_IMAGE_URLS <<< "$ROMAN_PANEL_IMAGE_URLS"
+else
+    PANEL_IMAGE_URLS=(
+        "https://assets.science.nasa.gov/content/dam/science/missions/rst/spacecraft-illustrations/Roman_BeautyPass2026-med.png/jcr:content/renditions/cq5dam.web.1280.1280.png"
+    )
+fi
 PANEL_IMAGE_LOCAL_FILES=()
 pimg_i=0
 for piu in "${PANEL_IMAGE_URLS[@]}"; do
+    piu="${piu#"${piu%%[![:space:]]*}"}"
+    piu="${piu%"${piu##*[![:space:]]}"}"
+    [ -z "$piu" ] && continue
     pimg_i=$((pimg_i + 1))
     dest="panel_img_${pimg_i}.jpg"
     echo "Downloading panel image ${pimg_i} ($(basename "$piu"))..."
@@ -265,6 +301,37 @@ CLOCK_PID=$!
 #############################################
 printf '0d 00h 00m 00s' > "$ASSET_DIR/mission_clock.txt"
 printf 'DAY 0' > "$ASSET_DIR/mission_day.txt"
+
+# ---------------------------------------------------------------
+# NEXT MILESTONE table. Real, already-happened commissioning events
+# (mid-course burn, antenna/visor deploy, planet imager power-on) are
+# dated from NASA's own Roman blog. Everything after that is NASA's
+# typical commissioning sequence with an operator-editable day
+# estimate, not a published date — each is labeled "(est.)" in the
+# label text itself so the on-screen line is honest about which kind
+# of milestone it's showing. Override the whole table by creating a
+# "milestones.txt" file (one "day,text" pair per line, day = mission
+# day the event is expected) next to this script; the built-in
+# defaults below are the fallback.
+# ---------------------------------------------------------------
+ROMAN_MILESTONES_FILE="${ROMAN_MILESTONES_FILE:-milestones.txt}"
+if [ -f "$ROMAN_MILESTONES_FILE" ]; then
+    echo "Using curated milestone table: $ROMAN_MILESTONES_FILE"
+else
+    cat > "$ROMAN_MILESTONES_FILE" << 'MSEOF'
+1,First mid-course correction burn
+2,Antenna and sunshade visor deployed
+2,Wide Field Instrument planet imager powered on
+10,Instrument cooldown and focus alignment begins (est.)
+30,Coronagraph Instrument decontamination (est.)
+45,Reaction wheel characterization (est.)
+70,WFI-Coronagraph alignment and calibration (est.)
+85,Science commissioning and characterization begins (est.)
+92,Arrival at Sun-Earth L2, science operations begin (est.)
+MSEOF
+fi
+
+printf ' ' > "$ASSET_DIR/next_milestone.txt"
 (
     while true; do
         NOW_S=$(date -u +%s)
@@ -278,6 +345,29 @@ printf 'DAY 0' > "$ASSET_DIR/mission_day.txt"
         mv -f "$ASSET_DIR/mission_clock.txt.tmp" "$ASSET_DIR/mission_clock.txt"
         printf 'DAY %d' "$D" > "$ASSET_DIR/mission_day.txt.tmp"
         mv -f "$ASSET_DIR/mission_day.txt.tmp" "$ASSET_DIR/mission_day.txt"
+
+        NEXT_MS=""
+        while IFS=',' read -r ms_day ms_text; do
+            ms_day="$(echo "$ms_day" | tr -d '[:space:]')"
+            [[ "$ms_day" =~ ^[0-9]+$ ]] || continue
+            if [ "$ms_day" -gt "$D" ]; then
+                NEXT_MS="$ms_text"
+                break
+            fi
+        done < "$ROMAN_MILESTONES_FILE"
+        if [ -z "$NEXT_MS" ]; then
+            NEXT_MS="Science operations underway"
+        fi
+        # Truncated to one line's worth of characters at this panel's
+        # width/fontsize (rather than wrapped to multiple lines) since
+        # this file is read live with reload=1 — wrapping would need
+        # re-folding on every change, which reload=1 text can't do.
+        if [ "${#NEXT_MS}" -gt 42 ]; then
+            NEXT_MS="${NEXT_MS:0:41}…"
+        fi
+        printf '%s' "$NEXT_MS" > "$ASSET_DIR/next_milestone.txt.tmp"
+        mv -f "$ASSET_DIR/next_milestone.txt.tmp" "$ASSET_DIR/next_milestone.txt"
+
         sleep 1
     done
 ) &
@@ -362,6 +452,7 @@ fi
 printf ' ' > "$ASSET_DIR/dsn_station.txt"
 printf ' ' > "$ASSET_DIR/dsn_rate.txt"
 printf ' ' > "$ASSET_DIR/dsn_distance.txt"
+printf ' ' > "$ASSET_DIR/dsn_lighttime.txt"
 DSN_PID=""
 if [ "$SHOW_DSN" = true ]; then
     cat > dsn_poll.py << 'PYEOF'
@@ -439,12 +530,19 @@ try:
         try:
             rtlt_s = float(found_rtlt)
             # distance = one-way light time * speed of light
-            km = (rtlt_s / 2.0) * 299792.458
+            one_way_s = rtlt_s / 2.0
+            km = one_way_s * 299792.458
             write("dsn_distance", f"{km:,.0f} km")
+            if one_way_s >= 60:
+                write("dsn_lighttime", f"{one_way_s/60:.1f} min (one-way)")
+            else:
+                write("dsn_lighttime", f"{one_way_s:.1f} s (one-way)")
         except ValueError:
             write("dsn_distance", " ")
+            write("dsn_lighttime", " ")
     else:
         write("dsn_distance", " ")
+        write("dsn_lighttime", " ")
 
 except Exception:
     # Leave whatever was already on disk — a single failed poll
@@ -626,7 +724,7 @@ else
     echo "NOTICE: Horizons distance panel disabled (set ENABLE_HORIZONS=true to try it). Distance fields will stay blank."
 fi
 
-trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$DSN_PID" ] && kill "$DSN_PID" 2>/dev/null || true; [ -n "$HORIZONS_PID" ] && kill "$HORIZONS_PID" 2>/dev/null || true; kill "$DISTEST_PID" 2>/dev/null || true' EXIT
+trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$DSN_PID" ] && kill "$DSN_PID" 2>/dev/null || true; [ -n "$HORIZONS_PID" ] && kill "$HORIZONS_PID" 2>/dev/null || true; kill "$DISTEST_PID" 2>/dev/null || true; kill "$TRIVIA_PID" 2>/dev/null || true' EXIT
 
 #############################################
 # Static panel text (unchanged across videos)
@@ -636,6 +734,45 @@ printf 'S P A C E   T E L E S C O P E'       > "$ASSET_DIR/title2.txt"
 printf "T O D A Y ' S   M I S S I O N   U P D A T E" > "$ASSET_DIR/header.txt"
 printf 'LIVE · JOURNEY TO L2'                > "$ASSET_DIR/eyebrow.txt"
 printf 'SUBSCRIBE to follow the mission'     > "$ASSET_DIR/cta.txt"
+
+#############################################
+# "ASK ROMAN" trivia CTA — alternates with the subscribe prompt in
+# the same on-screen slot (see build_final_filter) so the periodic
+# call-to-action isn't just "subscribe" on every cycle. Rotated by a
+# lightweight background writer, same pattern as next_milestone.
+#############################################
+DEFAULT_TRIVIA=(
+    "ASK ROMAN: mirror size? 2.4m — same as Hubble's."
+    "ASK ROMAN: field of view? 100x wider than Hubble."
+    "ASK ROMAN: destination? Sun-Earth L2, ~1.5M km out."
+    "ASK ROMAN: named for? NASA's first chief astronomer."
+    "ASK ROMAN: launch vehicle? A SpaceX Falcon Heavy."
+    "ASK ROMAN: mission length? At least 5 years at L2."
+    "ASK ROMAN: what's a coronagraph? A starlight blocker."
+    "ASK ROMAN: exoplanet goal? Toward 100,000 known worlds."
+)
+TRIVIA_FILE="${TRIVIA_FILE:-trivia.txt}"
+if [ -f "$TRIVIA_FILE" ]; then
+    echo "Using curated trivia pool: $TRIVIA_FILE"
+    TRIVIA_POOL=()
+    while IFS= read -r line; do
+        [ -n "$(echo "$line" | tr -d '[:space:]')" ] && TRIVIA_POOL+=("$line")
+    done < "$TRIVIA_FILE"
+else
+    TRIVIA_POOL=("${DEFAULT_TRIVIA[@]}")
+fi
+printf '%s' "${TRIVIA_POOL[0]}" > "$ASSET_DIR/cta_trivia.txt"
+(
+    ti=0
+    n=${#TRIVIA_POOL[@]}
+    while true; do
+        sleep 240
+        ti=$(((ti + 1) % n))
+        printf '%s' "${TRIVIA_POOL[$ti]}" > "$ASSET_DIR/cta_trivia.txt.tmp"
+        mv -f "$ASSET_DIR/cta_trivia.txt.tmp" "$ASSET_DIR/cta_trivia.txt"
+    done
+) &
+TRIVIA_PID=$!
 printf 'DID YOU KNOW'                        > "$ASSET_DIR/fact_label.txt"
 printf 'PAYLOAD'                             > "$ASSET_DIR/instr_label.txt"
 printf 'WFI · CORONAGRAPH'                   > "$ASSET_DIR/instr_title.txt"
@@ -962,8 +1099,22 @@ prepare_video_content() {
     CHAIN+="[br5]drawbox=x=$((VX0 + BR_M)):y=$((VY1 - BR_M - BR_L)):w=${BR_T}:h=${BR_L}:color=${GOLD}@0.9:t=fill[br6];"
     CHAIN+="[br6]drawbox=x=$((VX1 - BR_M - BR_L)):y=$((VY1 - BR_M - BR_T)):w=${BR_L}:h=${BR_T}:color=${GOLD}@0.9:t=fill[br7];"
     CHAIN+="[br7]drawbox=x=$((VX1 - BR_M - BR_T)):y=$((VY1 - BR_M - BR_L)):w=${BR_T}:h=${BR_L}:color=${GOLD}@0.9:t=fill[br8];"
-    CHAIN+="[br8]drawbox=x=${VX0}:y=$((VY1 - 34)):w=220:h=34:color=black@0.55:t=fill[brcap1];"
-    CHAIN+="[brcap1]drawtext=fontfile=${FONT}:text='ROMAN LIVE FEED':fontcolor=white@0.9:fontsize=13:x=$((VX0 + 14)):y=$((VY1 - 22)):${SHADOW}[brcap2];"
+
+    # Small reticle nodes at each bracket vertex + center tick marks on
+    # the top/bottom edges — a targeting-reticle touch (like the "Eyes"
+    # app's spacecraft-tracking view) instead of plain L-brackets.
+    local BR_DOT=3
+    CHAIN+="[br8]drawbox=x=$((VX0 + BR_M - 1)):y=$((VY0 + BR_M - 1)):w=${BR_DOT}:h=${BR_DOT}:color=${GOLD}:t=fill[brdot1];"
+    CHAIN+="[brdot1]drawbox=x=$((VX1 - BR_M - 2)):y=$((VY0 + BR_M - 1)):w=${BR_DOT}:h=${BR_DOT}:color=${GOLD}:t=fill[brdot2];"
+    CHAIN+="[brdot2]drawbox=x=$((VX0 + BR_M - 1)):y=$((VY1 - BR_M - 2)):w=${BR_DOT}:h=${BR_DOT}:color=${GOLD}:t=fill[brdot3];"
+    CHAIN+="[brdot3]drawbox=x=$((VX1 - BR_M - 2)):y=$((VY1 - BR_M - 2)):w=${BR_DOT}:h=${BR_DOT}:color=${GOLD}:t=fill[brdot4];"
+    local VMID_X=$((VX0 + CENTER_W / 2))
+    CHAIN+="[brdot4]drawbox=x=$((VMID_X - 1)):y=${VY0}:w=2:h=8:color=${GOLD}@0.7:t=fill[brtick1];"
+    CHAIN+="[brtick1]drawbox=x=$((VMID_X - 1)):y=$((VY1 - 8)):w=2:h=8:color=${GOLD}@0.7:t=fill[br8b];"
+    local CAPTION_W=$(( ${#VIDEO_FEED_LABEL} * 8 + 30 ))
+    [ "$CAPTION_W" -lt 150 ] && CAPTION_W=150
+    CHAIN+="[br8b]drawbox=x=${VX0}:y=$((VY1 - 34)):w=${CAPTION_W}:h=34:color=black@0.55:t=fill[brcap1];"
+    CHAIN+="[brcap1]drawtext=fontfile=${FONT}:text='${VIDEO_FEED_LABEL}':fontcolor=white@0.9:fontsize=13:x=$((VX0 + 14)):y=$((VY1 - 22)):${SHADOW}[brcap2];"
     local prev="brcap2"
 
     local CARD_PAD=10
@@ -1061,7 +1212,10 @@ prepare_video_content() {
     # ---------------- Left panel: story / headlines (unchanged structure) ----------------
     CHAIN+="[${prev}]drawbox=x=0:y=0:w=${PANEL_W}:h=720:color=${PANEL_BG}@0.94:t=fill[p1];"
     CHAIN+="[p1]drawbox=x=${PANEL_W}:y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[p2];"
-    CHAIN+="[p2]drawbox=x=0:y=0:w=${PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[p3];"
+    # Top-edge "glow" (a soft wide bar under a thin bright one) instead
+    # of a single flat line — reads less like a flat UI divider.
+    CHAIN+="[p2]drawbox=x=0:y=0:w=${PANEL_W}:h=10:color=${GOLD}@0.18:t=fill[p2g];"
+    CHAIN+="[p2g]drawbox=x=0:y=0:w=${PANEL_W}:h=3:color=${GOLD}@0.95:t=fill[p3];"
 
     CHAIN+="[p3]drawbox=x=27:y=28:w=11:h=11:color=${RED}:t=fill:enable='lt(mod(t\,1)\,0.6)'[p4];"
     CHAIN+="[p4]drawtext=fontfile=${FONT}:text='LIVE':fontcolor=white:fontsize=30:x=44:y=19[p5];"
@@ -1073,8 +1227,10 @@ prepare_video_content() {
 
     CHAIN+="[p9]drawbox=x=${TEXT_INSET}:y=171:w=8:h=8:color=${GOLD}:t=fill[p10];"
     CHAIN+="[p10]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=14:x=$((TEXT_INSET + 16)):y=168[p11];"
+    CHAIN+="[p11]drawtext=fontfile=${FONT}:text='NEXT\: ':fontcolor=white@0.45:fontsize=12:x=${TEXT_INSET}:y=191[p11b];"
+    CHAIN+="[p11b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/next_milestone.txt:reload=1:fontcolor=${GOLD}@0.85:fontsize=12:x=$((TEXT_INSET + 42)):y=191[p11c];"
 
-    local prev="p11"
+    local prev="p11c"
     for i in "${!RAW_LINES[@]}"; do
         idx=$((i + 1))
         local start=$((i * SLOT))
@@ -1144,7 +1300,8 @@ prepare_video_content() {
     # ---------------- Right panel: stats + payload + facts ----------------
     CHAIN+="[${prev}]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=720:color=${PANEL_BG}@0.94:t=fill[r1];"
     CHAIN+="[r1]drawbox=x=$((RIGHT_X0 - 3)):y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[r2];"
-    CHAIN+="[r2]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[r3];"
+    CHAIN+="[r2]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=10:color=${GOLD}@0.18:t=fill[r2g];"
+    CHAIN+="[r2g]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=3:color=${GOLD}@0.95:t=fill[r3];"
 
     CHAIN+="[r3]drawtext=fontfile=${FONT}:text='Credits\: NASA / GSFC':fontcolor=white@0.85:fontsize=14:x=${RTEXT_INSET}:y=${RSTAT_Y}[r4];"
     CHAIN+="[r4]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=14:x=${RTEXT_INSET}:y=$((RSTAT_Y + 20))[r5];"
@@ -1177,7 +1334,8 @@ prepare_video_content() {
     local RREAD_LINE1_Y=$((RREAD_LABEL_Y + 22))
     local RREAD_LINE2_Y=$((RREAD_LINE1_Y + 20))
     local RREAD_LINE3_Y=$((RREAD_LINE2_Y + 20))
-    local RGRAPH_LABEL_Y=$((RREAD_LINE3_Y + 30))
+    local RREAD_LINE4_Y=$((RREAD_LINE3_Y + 20))
+    local RGRAPH_LABEL_Y=$((RREAD_LINE4_Y + 30))
 
     CHAIN+="[${prev}]drawbox=x=${RTEXT_INSET}:y=${RREAD_DIV_Y}:w=${PANEL_TEXT_W}:h=2:color=white@0.15:t=fill[rr0];"
     CHAIN+="[rr0]drawtext=fontfile=${FONT}:text='DSN TRACKING (LIVE)':fontcolor=${GOLD}@0.85:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LABEL_Y}[rr0b];"
@@ -1186,7 +1344,9 @@ prepare_video_content() {
     CHAIN+="[rr1]drawtext=fontfile=${FONT}:text='DATA RATE':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE2_Y}[rr1b];"
     CHAIN+="[rr1b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_rate.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE2_Y}[rr2];"
     CHAIN+="[rr2]drawtext=fontfile=${FONT}:text='RANGE (DSN)':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE3_Y}[rr2b];"
-    CHAIN+="[rr2b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_distance.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE3_Y}[rr3];"
+    CHAIN+="[rr2b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_distance.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE3_Y}[rr2c];"
+    CHAIN+="[rr2c]drawtext=fontfile=${FONT}:text='LIGHT TIME':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE4_Y}[rr2d];"
+    CHAIN+="[rr2d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_lighttime.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE4_Y}[rr3];"
     prev="rr3"
 
     # ---------------- Right panel: mission-clock pie/percent gauge ----------------
@@ -1245,6 +1405,13 @@ build_final_filter() {
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.6)\,mod(t\,${CTA_CYCLE})/0.6\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.6)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.6\,1))\,0)"
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
     local COUNTDOWN_ENABLE="not(${CTA_ENABLE})"
+    # Alternate the subscribe CTA with the "ASK ROMAN" trivia CTA every
+    # other cycle, so the periodic call-to-action isn't the same line
+    # each time. Parity is relative to this video's own start time
+    # (ffmpeg's `t`), so a single long-running video will still cycle
+    # between the two; short/looping clips mostly land on the first.
+    local CTA_EVEN="eq(mod(trunc(t/${CTA_CYCLE})\,2)\,0)"
+    local CTA_ODD="eq(mod(trunc(t/${CTA_CYCLE})\,2)\,1)"
 
     local CTA_W=460
     local CTA_X=$((CENTER_X0 + (CENTER_W - CTA_W) / 2))
@@ -1253,7 +1420,8 @@ build_final_filter() {
     tail+="[${FACT_END}]drawbox=x=${CTA_X}:y=${CTA_Y}:w=${CTA_W}:h=43:color=black@0.75:t=fill[cta_bg];"
     tail+="[cta_bg]drawbox=x=${CTA_X}:y=${CTA_Y}:w=4:h=43:color=${GOLD}:t=fill[cta_bar];"
     tail+="[cta_bar]drawbox=x=$((CTA_X + 22)):y=$((CTA_Y + 16)):w=11:h=11:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
-    tail+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):alpha='${CTA_ALPHA}'[cta_sub];"
+    tail+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):alpha='${CTA_ALPHA}':enable='${CTA_EVEN}'[cta_sub0];"
+    tail+="[cta_sub0]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta_trivia.txt:reload=1:fontcolor=${GOLD}:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):alpha='${CTA_ALPHA}':enable='${CTA_ODD}'[cta_sub];"
 
     if [[ "$total_duration" =~ ^[0-9]+$ ]] && [ "$total_duration" -gt 0 ]; then
         tail+="[cta_sub]drawtext=fontfile=${FONT}:text='Next view in %{eif\:max(${total_duration}-t\,0)\:d}s':fontcolor=white:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):enable='${COUNTDOWN_ENABLE}'[cta_final];"
@@ -1268,7 +1436,14 @@ build_final_filter() {
     tail+="[tk4]drawbox=x=0:y=682:w=113:h=38:color=${GOLD}:t=fill[tk5];"
     tail+="[tk5]drawtext=fontfile=${FONT}:text='LIVE NOW':fontcolor=black:fontsize=15:x=13:y=695[tk6];"
 
-    tail+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.45:fontsize=14:borderw=1.5:bordercolor=black@0.7:x=(w-text_w)/2:y=657[final]"
+    # Small NASA wordmark chip, mirroring the LIVE NOW chip on the
+    # opposite corner — plain styled text, not a reproduction of the
+    # NASA insignia/meatball artwork.
+    tail+="[tk6]drawbox=x=1160:y=680:w=120:h=40:color=black@0.9:t=fill[tk7];"
+    tail+="[tk7]drawbox=x=1163:y=682:w=113:h=38:color=${RED}:t=fill[tk8];"
+    tail+="[tk8]drawtext=fontfile=${FONT}:text='N A S A':fontcolor=white:fontsize=15:x=1180:y=695[tk9];"
+
+    tail+="[tk9]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.45:fontsize=14:borderw=1.5:bordercolor=black@0.7:x=(w-text_w)/2:y=657[final]"
 
     echo "$tail"
 }
@@ -1321,6 +1496,30 @@ run_video() {
         fi
         stream_source="$local_img"
         echo "Image slide: $url -> $stream_source"
+    else
+        # Reachability pre-check for real video URLs: a HEAD request
+        # with a short timeout, separate from the duration probe below
+        # (which can legitimately fail on a reachable-but-metadata-less
+        # stream). If the URL is genuinely unreachable and a fallback
+        # image is configured, use it for this rotation instead of
+        # burning MAX_RETRIES * RETRY_DELAY seconds retrying a dead
+        # video that was never going to connect.
+        if ! curl -sI --fail --max-time 10 "$url" >/dev/null 2>&1; then
+            echo "WARNING: '$url' did not respond to a reachability check."
+            if [ -n "$FALLBACK_IMAGE_URL" ]; then
+                echo "Falling back to FALLBACK_IMAGE_URL for this rotation: $FALLBACK_IMAGE_URL"
+                local fallback_local
+                if fallback_local=$(get_image_local_path "$FALLBACK_IMAGE_URL"); then
+                    url="$FALLBACK_IMAGE_URL"
+                    is_image=true
+                    stream_source="$fallback_local"
+                else
+                    echo "WARNING: fallback image also failed to download — proceeding with normal retries against the original URL."
+                fi
+            else
+                echo "  (set FALLBACK_IMAGE_URL to skip straight to a fallback slide instead of retrying.)"
+            fi
+        fi
     fi
 
     prepare_video_content "$url"
