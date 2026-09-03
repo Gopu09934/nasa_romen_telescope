@@ -97,8 +97,14 @@ echo "FPS               : 30"
 echo "========================================"
 
 FONT="font.ttf"
-GOLD="0xE8A33D"
-RED="0xE8453C"
+# NASA-brand-adjacent palette: azure accent (echoes the blue used across
+# NASA's Eyes app and mission dashboards) + NASA "insignia red" for the
+# live indicator, on a deep navy panel background instead of flat black —
+# reads as a space-agency dashboard rather than the solar script's
+# amber/red documentary look.
+GOLD="0x3EA6FF"
+RED="0xFC3D21"
+PANEL_BG="0x060B14"
 ASSET_DIR="panel_assets"
 INFO_FILE="mission_info.txt"
 SLOT=6            # seconds each headline is shown
@@ -466,6 +472,63 @@ fi
 printf ' ' > "$ASSET_DIR/dist_from_earth.txt"
 printf ' ' > "$ASSET_DIR/dist_traveled.txt"
 HORIZONS_PID=""
+
+#############################################
+# Background DISTANCE ESTIMATE writer — always on, so the Mission
+# Status card is never left blank even when neither DSN nor Horizons
+# currently has a live number for Roman (the common case in the days
+# right after launch). This is a modeled estimate, not telemetry:
+# it interpolates between a low-Earth-orbit start and Roman's L2
+# target distance (~1,500,000 km) using a smoothstep easing over
+# JOURNEY_TOTAL_DAYS, which roughly matches the shape of a real
+# translunar-style transfer (fast climb in the middle, slower at
+# both ends). "Distance traveled" is derived from the same curve's
+# path length times a 1.08 route-inefficiency factor (a straight
+# radial line understates the real, slightly curved trajectory),
+# plus the seed. Labeled "(est.)" everywhere it's shown so it's
+# never mistaken for a tracked figure. prepare_video_content()
+# below prefers the real DSN/Horizons files over these whenever
+# either has live data.
+#############################################
+printf ' ' > "$ASSET_DIR/dist_from_earth_est.txt"
+printf ' ' > "$ASSET_DIR/dist_traveled_est.txt"
+L2_DIST_KM=1500000
+cat > dist_estimate.py << 'PYEOF'
+import sys
+import time
+
+launch_epoch = float(sys.argv[1])
+journey_total_days = float(sys.argv[2])
+seed_km = float(sys.argv[3])
+l2_dist_km = float(sys.argv[4])
+asset_dir = sys.argv[5]
+
+def write(name, text):
+    import os
+    tmp = f"{asset_dir}/{name}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, f"{asset_dir}/{name}.txt")
+
+def fmt_km(km):
+    return f"{km:,.0f} km (est.)"
+
+while True:
+    elapsed = max(0.0, time.time() - launch_epoch)
+    total_s = journey_total_days * 86400.0
+    frac = min(1.0, elapsed / total_s) if total_s > 0 else 1.0
+    eased = 3 * frac**2 - 2 * frac**3  # smoothstep easing
+    dist_from_earth = l2_dist_km * eased
+    dist_traveled = seed_km + dist_from_earth * 1.08  # route-inefficiency factor
+    write("dist_from_earth_est", fmt_km(dist_from_earth))
+    write("dist_traveled_est", fmt_km(dist_traveled))
+    time.sleep(10)
+PYEOF
+(
+    python3 dist_estimate.py "$ROMAN_LAUNCH_EPOCH_S" "$JOURNEY_TOTAL_DAYS" "$ROMAN_DISTANCE_TRAVELED_SEED_KM" "$L2_DIST_KM" "$ASSET_DIR" \
+        2>/tmp/dist_estimate_err.log || echo "WARNING: distance estimator stopped — $(tail -1 /tmp/dist_estimate_err.log 2>/dev/null)"
+) &
+DISTEST_PID=$!
 if [ "$SHOW_HORIZONS" = true ]; then
     cat > horizons_poll.py << 'PYEOF'
 import sys
@@ -563,7 +626,7 @@ else
     echo "NOTICE: Horizons distance panel disabled (set ENABLE_HORIZONS=true to try it). Distance fields will stay blank."
 fi
 
-trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$DSN_PID" ] && kill "$DSN_PID" 2>/dev/null || true; [ -n "$HORIZONS_PID" ] && kill "$HORIZONS_PID" 2>/dev/null || true' EXIT
+trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$DSN_PID" ] && kill "$DSN_PID" 2>/dev/null || true; [ -n "$HORIZONS_PID" ] && kill "$HORIZONS_PID" 2>/dev/null || true; kill "$DISTEST_PID" 2>/dev/null || true' EXIT
 
 #############################################
 # Static panel text (unchanged across videos)
@@ -806,6 +869,21 @@ prepare_video_content() {
         done < <(printf '%s\n' "${fpool[@]}" | shuf)
     fi
 
+    # Prefer real DSN/Horizons readings over the modeled estimate
+    # whenever either has actually produced a number recently — this
+    # is re-checked every video rotation, so the card switches over
+    # to live data automatically the moment a real reading appears.
+    if [ -s "$ASSET_DIR/dist_from_earth.txt" ] && grep -q '[0-9]' "$ASSET_DIR/dist_from_earth.txt"; then
+        DIST_FROM_EARTH_FILE="dist_from_earth.txt"
+    else
+        DIST_FROM_EARTH_FILE="dist_from_earth_est.txt"
+    fi
+    if [ -s "$ASSET_DIR/dist_traveled.txt" ] && grep -q '[0-9]' "$ASSET_DIR/dist_traveled.txt"; then
+        DIST_TRAVELED_FILE="dist_traveled.txt"
+    else
+        DIST_TRAVELED_FILE="dist_traveled_est.txt"
+    fi
+
     if [ -f "${base}.instrument.txt" ]; then
         head -n 1 "${base}.instrument.txt" > "$ASSET_DIR/instr_sub.txt"
     else
@@ -895,7 +973,7 @@ prepare_video_content() {
     # ---------------- Row 2: MISSION STATUS card ----------------
     local CM3_Y0=$((ROW2_Y + CARD_PAD))
     local CM3_Y1=$((ROW3_Y - CARD_PAD))
-    CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM3_Y0}:w=${CARD_W}:h=$((CM3_Y1 - CM3_Y0)):color=black@0.22:t=fill[cm3card];"
+    CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM3_Y0}:w=${CARD_W}:h=$((CM3_Y1 - CM3_Y0)):color=${PANEL_BG}@0.55:t=fill[cm3card];"
     CHAIN+="[cm3card]drawbox=x=${CARD_X0}:y=${CM3_Y0}:w=${CARD_W}:h=$((CM3_Y1 - CM3_Y0)):color=${GOLD}@0.3:t=1[cm3border];"
 
     local CM3_LABEL_Y=$((CM3_Y0 + 20))
@@ -913,9 +991,9 @@ prepare_video_content() {
     CHAIN+="[cm3c]drawtext=fontfile=${FONT}:text='ELAPSED TIME':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE2_Y}[cm3d];"
     CHAIN+="[cm3d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_clock.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE2_Y}[cm3e];"
     CHAIN+="[cm3e]drawtext=fontfile=${FONT}:text='DIST. FROM EARTH':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE3_Y}[cm3f];"
-    CHAIN+="[cm3f]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dist_from_earth.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE3_Y}[cm3g];"
+    CHAIN+="[cm3f]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/${DIST_FROM_EARTH_FILE}:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE3_Y}[cm3g];"
     CHAIN+="[cm3g]drawtext=fontfile=${FONT}:text='DIST. TRAVELED':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE4_Y}[cm3h];"
-    CHAIN+="[cm3h]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dist_traveled.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE4_Y}[cm3i];"
+    CHAIN+="[cm3h]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/${DIST_TRAVELED_FILE}:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE4_Y}[cm3i];"
     CHAIN+="[cm3i]drawtext=fontfile=${FONT}:text='TARGET':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE5_Y}[cm3j];"
     CHAIN+="[cm3j]drawtext=fontfile=${FONT}:text='Sun-Earth L2':fontcolor=${GOLD}:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE5_Y}[cm3final];"
     prev="cm3final"
@@ -946,7 +1024,7 @@ prepare_video_content() {
     # a planning estimate, clearly labeled as such, not a tracked figure.
     local CM4_Y0=$((ROW3_Y + CARD_PAD))
     local CM4_Y1=$((680 - CARD_PAD))
-    CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM4_Y0}:w=${CARD_W}:h=$((CM4_Y1 - CM4_Y0)):color=black@0.22:t=fill[cm4card];"
+    CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM4_Y0}:w=${CARD_W}:h=$((CM4_Y1 - CM4_Y0)):color=${PANEL_BG}@0.55:t=fill[cm4card];"
     CHAIN+="[cm4card]drawbox=x=${CARD_X0}:y=${CM4_Y0}:w=${CARD_W}:h=$((CM4_Y1 - CM4_Y0)):color=${RED}@0.3:t=1[cm4border];"
 
     local CM4_LABEL_Y=$((CM4_Y0 + 20))
@@ -981,7 +1059,7 @@ prepare_video_content() {
     prev="cm4base"
 
     # ---------------- Left panel: story / headlines (unchanged structure) ----------------
-    CHAIN+="[${prev}]drawbox=x=0:y=0:w=${PANEL_W}:h=720:color=black@0.92:t=fill[p1];"
+    CHAIN+="[${prev}]drawbox=x=0:y=0:w=${PANEL_W}:h=720:color=${PANEL_BG}@0.94:t=fill[p1];"
     CHAIN+="[p1]drawbox=x=${PANEL_W}:y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[p2];"
     CHAIN+="[p2]drawbox=x=0:y=0:w=${PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[p3];"
 
@@ -1064,7 +1142,7 @@ prepare_video_content() {
     prev="sabase"
 
     # ---------------- Right panel: stats + payload + facts ----------------
-    CHAIN+="[${prev}]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=720:color=black@0.92:t=fill[r1];"
+    CHAIN+="[${prev}]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=720:color=${PANEL_BG}@0.94:t=fill[r1];"
     CHAIN+="[r1]drawbox=x=$((RIGHT_X0 - 3)):y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[r2];"
     CHAIN+="[r2]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[r3];"
 
