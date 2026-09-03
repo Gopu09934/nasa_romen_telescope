@@ -956,11 +956,25 @@ prepare_video_content() {
     local CM4_BAR_W=$((CARD_W - 40))
     local JOURNEY_TOTAL_SECONDS=$((JOURNEY_TOTAL_DAYS * 86400))
 
+    # ffmpeg's own `t` variable is relative to when THIS video's ffmpeg
+    # process started, not to the real launch date, so the fill amount
+    # is computed here in bash (real wall-clock elapsed / planned
+    # cruise length) each time prepare_video_content runs — i.e. it
+    # refreshes on every video rotation, not frame-by-frame, which is
+    # more than fine for a bar that moves over weeks.
+    local NOW_S_FOR_BAR
+    NOW_S_FOR_BAR=$(date -u +%s)
+    local ELAPSED_S_FOR_BAR=$((NOW_S_FOR_BAR - ROMAN_LAUNCH_EPOCH_S))
+    [ "$ELAPSED_S_FOR_BAR" -lt 0 ] && ELAPSED_S_FOR_BAR=0
+    local CM4_FILL_W=$((CM4_BAR_W * ELAPSED_S_FOR_BAR / JOURNEY_TOTAL_SECONDS))
+    [ "$CM4_FILL_W" -gt "$CM4_BAR_W" ] && CM4_FILL_W=$CM4_BAR_W
+    [ "$CM4_FILL_W" -lt 0 ] && CM4_FILL_W=0
+
     CHAIN+="[cm4border]drawbox=x=$((MTEXT_INSET - 2)):y=$((CM4_LABEL_Y - 2)):w=6:h=6:color=${RED}:t=fill:enable='lt(mod(t\,1.2)\,0.75)'[cm4a];"
     CHAIN+="[cm4a]drawtext=fontfile=${FONT}:text='JOURNEY TO L2 (est.)':fontcolor=white@0.75:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM4_LABEL_Y - 6))[cm4b];"
     CHAIN+="[cm4b]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=black@0.4:t=fill[cm4barbg];"
     CHAIN+="[cm4barbg]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=white@0.2:t=1[cm4barborder];"
-    CHAIN+="[cm4barborder]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w='min(${CM4_BAR_W}\,${CM4_BAR_W}*(t+$((ROMAN_LAUNCH_EPOCH_S)))/1)':h=${CM4_BAR_H}:color=${GOLD}@0.85:t=fill:enable='between(t\,0\,999999999)'[cm4fillraw];"
+    CHAIN+="[cm4barborder]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_FILL_W}:h=${CM4_BAR_H}:color=${GOLD}@0.85:t=fill[cm4fillraw];"
     prev="cm4fillraw"
     CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_day.txt:reload=1:fontcolor=white:fontsize=13:x=$((CM4_BAR_X)):y=$((CM4_BAR_Y + CM4_BAR_H + 12)):${SHADOW}[cm4day];"
     CHAIN+="[cm4day]drawtext=fontfile=${FONT}:text='of ~${JOURNEY_TOTAL_DAYS} day cruise':fontcolor=white@0.55:fontsize=13:x=$((CM4_BAR_X + 90)):y=$((CM4_BAR_Y + CM4_BAR_H + 12))[cm4base];"
@@ -1113,13 +1127,15 @@ prepare_video_content() {
     local PIE_X=$((RTEXT_INSET + (PANEL_TEXT_W - PIE_SIZE) / 2))
     local PIE_Y=$PIE_TOP
 
-    # Percent of the estimated cruise elapsed so far, computed from the
-    # real launch epoch — clipped to [0,100] so it holds at 100 once
-    # Roman reaches L2 rather than wrapping around.
-    local PIE_PCT_EXPR="clip(100*(t+${ROMAN_LAUNCH_EPOCH_S}-${ROMAN_LAUNCH_EPOCH_S})/${JOURNEY_TOTAL_SECONDS}\,0\,100)"
+    # Same reasoning as the progress bar above: computed here in bash
+    # from the real wall clock (refreshes each video rotation), not
+    # from ffmpeg's per-video-relative `t`.
+    local PIE_PCT_NOW=$((100 * ELAPSED_S_FOR_BAR / JOURNEY_TOTAL_SECONDS))
+    [ "$PIE_PCT_NOW" -gt 100 ] && PIE_PCT_NOW=100
+    [ "$PIE_PCT_NOW" -lt 0 ] && PIE_PCT_NOW=0
     local PIE_DIST="hypot(X-${PIE_CX}\,Y-${PIE_CY})"
     local PIE_THETA="mod(atan2(Y-${PIE_CY}\,X-${PIE_CX})+PI/2+2*PI\,2*PI)"
-    local PIE_FILL_ANGLE="(2*PI*(${PIE_PCT_EXPR})/100)"
+    local PIE_FILL_ANGLE="(2*PI*${PIE_PCT_NOW}/100)"
     local PIE_R_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,if(lte(${PIE_THETA}\,${PIE_FILL_ANGLE})\,${GOLD_R}\,45)\,0)"
     local PIE_G_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,if(lte(${PIE_THETA}\,${PIE_FILL_ANGLE})\,${GOLD_G}\,45)\,0)"
     local PIE_B_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,if(lte(${PIE_THETA}\,${PIE_FILL_ANGLE})\,${GOLD_B}\,45)\,0)"
@@ -1130,7 +1146,7 @@ prepare_video_content() {
     CHAIN+="color=c=black@0:s=${PIE_SIZE}x${PIE_SIZE}[pie_src];"
     CHAIN+="[pie_src]format=rgba,geq=r='${PIE_R_EXPR}':g='${PIE_G_EXPR}':b='${PIE_B_EXPR}':a='${PIE_A_EXPR}'[pie_img];"
     CHAIN+="[rgp2][pie_img]overlay=x=${PIE_X}:y=${PIE_Y}:shortest=1[rgp3];"
-    CHAIN+="[rgp3]drawtext=fontfile=${FONT}:text='%{eif\:${PIE_PCT_EXPR}\:d} PCT':fontcolor=white:fontsize=16:x=$((PIE_X + PIE_SIZE / 2 - 28)):y=$((PIE_Y + PIE_SIZE / 2 - 9)):${SHADOW}[rgp4];"
+    CHAIN+="[rgp3]drawtext=fontfile=${FONT}:text='${PIE_PCT_NOW} PCT':fontcolor=white:fontsize=16:x=$((PIE_X + PIE_SIZE / 2 - 28)):y=$((PIE_Y + PIE_SIZE / 2 - 9)):${SHADOW}[rgp4];"
     CHAIN+="[rgp4]drawtext=fontfile=${FONT}:text='Launched Aug 30, 2026':fontcolor=white@0.5:fontsize=11:x=${RTEXT_INSET}:y=$((PIE_Y + PIE_SIZE + 12))[rgbase];"
     prev="rgbase"
 
