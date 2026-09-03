@@ -118,6 +118,22 @@ FALLBACK_IMAGE_URL="${FALLBACK_IMAGE_URL:-}"
 # ---------------------------------------------------------------
 ROMAN_PANEL_IMAGE_URLS="${ROMAN_PANEL_IMAGE_URLS:-}"
 
+# ---------------------------------------------------------------
+# Video crop zoom/pan. Some sources (e.g. a screen capture of NASA's
+# "Eyes on the Solar System" app) include their own UI chrome —
+# search bar, breadcrumb, an info side-panel — baked into the frame
+# alongside the spacecraft render. The default center-crop can't tell
+# UI chrome from the model, so it can end up in-frame overlapping this
+# script's own left panel. VIDEO_ZOOM (>1 crops in tighter) plus
+# VIDEO_PAN_X / VIDEO_PAN_Y (each -1..1, 0 = centered) let you shift
+# the crop window onto just the spacecraft/render portion of the
+# source and crop the chrome out entirely. Start with VIDEO_ZOOM=1.4
+# and nudge VIDEO_PAN_X toward +1 if the chrome sits on the left.
+# ---------------------------------------------------------------
+VIDEO_ZOOM="${VIDEO_ZOOM:-1.0}"
+VIDEO_PAN_X="${VIDEO_PAN_X:-0}"
+VIDEO_PAN_Y="${VIDEO_PAN_Y:-0}"
+
 echo "========================================"
 echo "Starting 24/7 YouTube Stream (Nancy Grace Roman Space Telescope)"
 echo "Output Resolution : 1280x720 (720p — sized for a 2-core CI runner)"
@@ -1079,7 +1095,16 @@ prepare_video_content() {
     # Rebuild BASE_CHAIN for this video's content
     #########################################
     CHAIN="color=c=black:s=1280x720[canvas];"
-    CHAIN+="[0:v]fps=30,scale=${CENTER_W}:${VIDEO_ROW_H}:force_original_aspect_ratio=increase,crop=${CENTER_W}:${VIDEO_ROW_H}[vidfit];"
+    # Scale by VIDEO_ZOOM extra so there's margin to pan within, then
+    # crop the fixed output size from a position offset by VIDEO_PAN_X/
+    # VIDEO_PAN_Y — at zoom=1.0/pan=0 this is identical to the old
+    # plain center-crop. crop's x/y expressions clamp to valid range on
+    # their own, so a pan value that would go out of bounds just pins
+    # to the edge instead of erroring.
+    local ZOOM_W ZOOM_H
+    ZOOM_W=$(awk -v w="$CENTER_W" -v z="$VIDEO_ZOOM" 'BEGIN{printf "%d", w*z}')
+    ZOOM_H=$(awk -v h="$VIDEO_ROW_H" -v z="$VIDEO_ZOOM" 'BEGIN{printf "%d", h*z}')
+    CHAIN+="[0:v]fps=30,scale=${ZOOM_W}:${ZOOM_H}:force_original_aspect_ratio=increase,crop=${CENTER_W}:${VIDEO_ROW_H}:x='(in_w-out_w)/2+(in_w-out_w)/2*${VIDEO_PAN_X}':y='(in_h-out_h)/2+(in_h-out_h)/2*${VIDEO_PAN_Y}'[vidfit];"
     CHAIN+="[canvas][vidfit]overlay=${CENTER_X0}:${ROW1_Y}:shortest=1[base];"
 
     build_labels_chain "$url"
@@ -1195,7 +1220,14 @@ prepare_video_content() {
     NOW_S_FOR_BAR=$(date -u +%s)
     local ELAPSED_S_FOR_BAR=$((NOW_S_FOR_BAR - ROMAN_LAUNCH_EPOCH_S))
     [ "$ELAPSED_S_FOR_BAR" -lt 0 ] && ELAPSED_S_FOR_BAR=0
-    local CM4_FILL_W=$((CM4_BAR_W * ELAPSED_S_FOR_BAR / JOURNEY_TOTAL_SECONDS))
+    # Smoothstep-eased fraction (same curve as the distance estimator
+    # above) rather than a straight elapsed/total ratio, so this bar,
+    # the CRUISE PROGRESS pie further down, and the DIST. FROM EARTH
+    # estimate all agree with each other instead of implying two
+    # different "how far along" numbers.
+    EASED_FRAC=$(awk -v e="$ELAPSED_S_FOR_BAR" -v t="$JOURNEY_TOTAL_SECONDS" 'BEGIN{f=e/t; if(f>1)f=1; if(f<0)f=0; eased=3*f*f-2*f*f*f; printf "%.6f", eased}')
+    local CM4_FILL_W
+    CM4_FILL_W=$(awk -v w="$CM4_BAR_W" -v f="$EASED_FRAC" 'BEGIN{printf "%d", w*f}')
     [ "$CM4_FILL_W" -gt "$CM4_BAR_W" ] && CM4_FILL_W=$CM4_BAR_W
     [ "$CM4_FILL_W" -lt 0 ] && CM4_FILL_W=0
 
@@ -1368,7 +1400,8 @@ prepare_video_content() {
     # Same reasoning as the progress bar above: computed here in bash
     # from the real wall clock (refreshes each video rotation), not
     # from ffmpeg's per-video-relative `t`.
-    local PIE_PCT_NOW=$((100 * ELAPSED_S_FOR_BAR / JOURNEY_TOTAL_SECONDS))
+    local PIE_PCT_NOW
+    PIE_PCT_NOW=$(awk -v f="$EASED_FRAC" 'BEGIN{printf "%d", f*100}')
     [ "$PIE_PCT_NOW" -gt 100 ] && PIE_PCT_NOW=100
     [ "$PIE_PCT_NOW" -lt 0 ] && PIE_PCT_NOW=0
     local PIE_DIST="hypot(X-${PIE_CX}\,Y-${PIE_CY})"
@@ -1404,7 +1437,6 @@ build_final_filter() {
     local CTA_SHOW=8
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.6)\,mod(t\,${CTA_CYCLE})/0.6\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.6)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.6\,1))\,0)"
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
-    local COUNTDOWN_ENABLE="not(${CTA_ENABLE})"
     # Alternate the subscribe CTA with the "ASK ROMAN" trivia CTA every
     # other cycle, so the periodic call-to-action isn't the same line
     # each time. Parity is relative to this video's own start time
@@ -1417,17 +1449,15 @@ build_final_filter() {
     local CTA_X=$((CENTER_X0 + (CENTER_W - CTA_W) / 2))
     local CTA_Y=640
 
-    tail+="[${FACT_END}]drawbox=x=${CTA_X}:y=${CTA_Y}:w=${CTA_W}:h=43:color=black@0.75:t=fill[cta_bg];"
-    tail+="[cta_bg]drawbox=x=${CTA_X}:y=${CTA_Y}:w=4:h=43:color=${GOLD}:t=fill[cta_bar];"
+    # The CTA box (and its accent bar / live dot) only appears during
+    # its own CTA_SHOW window now — no more "Next view in Ns" filler
+    # text in between, so it fully disappears rather than sitting on
+    # screen empty the rest of the cycle.
+    tail+="[${FACT_END}]drawbox=x=${CTA_X}:y=${CTA_Y}:w=${CTA_W}:h=43:color=black@0.75:t=fill:enable='${CTA_ENABLE}'[cta_bg];"
+    tail+="[cta_bg]drawbox=x=${CTA_X}:y=${CTA_Y}:w=4:h=43:color=${GOLD}:t=fill:enable='${CTA_ENABLE}'[cta_bar];"
     tail+="[cta_bar]drawbox=x=$((CTA_X + 22)):y=$((CTA_Y + 16)):w=11:h=11:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
     tail+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):alpha='${CTA_ALPHA}':enable='${CTA_EVEN}'[cta_sub0];"
-    tail+="[cta_sub0]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta_trivia.txt:reload=1:fontcolor=${GOLD}:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):alpha='${CTA_ALPHA}':enable='${CTA_ODD}'[cta_sub];"
-
-    if [[ "$total_duration" =~ ^[0-9]+$ ]] && [ "$total_duration" -gt 0 ]; then
-        tail+="[cta_sub]drawtext=fontfile=${FONT}:text='Next view in %{eif\:max(${total_duration}-t\,0)\:d}s':fontcolor=white:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):enable='${COUNTDOWN_ENABLE}'[cta_final];"
-    else
-        tail+="[cta_sub]drawtext=fontfile=${FONT}:text='Coming up next...':fontcolor=white@0.85:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):enable='${COUNTDOWN_ENABLE}'[cta_final];"
-    fi
+    tail+="[cta_sub0]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta_trivia.txt:reload=1:fontcolor=${GOLD}:fontsize=18:x=$((CTA_X + 40)):y=$((CTA_Y + 13)):alpha='${CTA_ALPHA}':enable='${CTA_ODD}'[cta_final];"
 
     tail+="[cta_final]drawbox=x=0:y=680:w=1280:h=40:color=black@0.85:t=fill[tk1];"
     tail+="[tk1]drawbox=x=0:y=680:w=1280:h=2:color=${GOLD}@0.9:t=fill[tk2];"
