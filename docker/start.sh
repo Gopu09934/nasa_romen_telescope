@@ -82,6 +82,25 @@ HORIZONS_API="https://ssd.jpl.nasa.gov/api/horizons.api"
 # stay accurate; this is an approximation, not telemetry.
 ROMAN_DISTANCE_TRAVELED_SEED_KM="${ROMAN_DISTANCE_TRAVELED_SEED_KM:-0}"
 
+# ---------------------------------------------------------------
+# Distance-from-Earth curve, calibrated against a real published NASA
+# figure instead of a generic shape. NASA's own mission tracker/SVS
+# visualizations show distance climbing fast right after launch and
+# slowing as Roman approaches L2 (a translunar-style transfer, not a
+# smooth S-curve) — so the model here is a power law dist(t) = A*t^p
+# (t in days since launch), with A and p solved so the curve passes
+# through launch (day 0 = 0 km), your anchor point below, and L2
+# arrival (day JOURNEY_TOTAL_DAYS ≈ 1,500,000 km).
+#
+# ROMAN_DIST_ANCHOR_DAY / ROMAN_DIST_ANCHOR_KM default to NASA's own
+# Day 3 figure (245,799 miles ≈ 395,600 km, from the official mission
+# tracker). Update these to whatever NASA publishes next — a later,
+# larger anchor point will noticeably improve accuracy across the
+# whole curve, not just near that day, since it reshapes the exponent.
+# ---------------------------------------------------------------
+ROMAN_DIST_ANCHOR_DAY="${ROMAN_DIST_ANCHOR_DAY:-3}"
+ROMAN_DIST_ANCHOR_KM="${ROMAN_DIST_ANCHOR_KM:-395600}"
+
 # Mission clock: computed purely from the wall clock + a fixed launch
 # epoch, so this one is exact (no API needed, no drift).
 # Nancy Grace Roman Space Telescope launched 2026-08-30 11:26:00 UTC
@@ -591,18 +610,18 @@ HORIZONS_PID=""
 # Background DISTANCE ESTIMATE writer — always on, so the Mission
 # Status card is never left blank even when neither DSN nor Horizons
 # currently has a live number for Roman (the common case in the days
-# right after launch). This is a modeled estimate, not telemetry:
-# it interpolates between a low-Earth-orbit start and Roman's L2
-# target distance (~1,500,000 km) using a smoothstep easing over
-# JOURNEY_TOTAL_DAYS, which roughly matches the shape of a real
-# translunar-style transfer (fast climb in the middle, slower at
-# both ends). "Distance traveled" is derived from the same curve's
-# path length times a 1.08 route-inefficiency factor (a straight
-# radial line understates the real, slightly curved trajectory),
-# plus the seed. Labeled "(est.)" everywhere it's shown so it's
-# never mistaken for a tracked figure. prepare_video_content()
-# below prefers the real DSN/Horizons files over these whenever
-# either has live data.
+# right after launch). This is a modeled estimate, not telemetry: a
+# power law dist(t) = A * t^p calibrated at startup so the curve
+# passes through launch (0 km), the ROMAN_DIST_ANCHOR_DAY/KM point
+# below, and L2 arrival (~1,500,000 km) at JOURNEY_TOTAL_DAYS — see
+# the calibration comment above ROMAN_DIST_ANCHOR_DAY for why a power
+# law fits a real translunar-style transfer much better than a plain
+# S-curve. "Distance traveled" is the same curve's implied path
+# length times a 1.08 route-inefficiency factor (a straight radial
+# line understates the real, slightly curved trajectory), plus the
+# seed. Labeled "(est.)" everywhere it's shown so it's never mistaken
+# for a tracked figure. prepare_video_content() below prefers the
+# real DSN/Horizons files over these whenever either has live data.
 #############################################
 printf ' ' > "$ASSET_DIR/dist_from_earth_est.txt"
 printf ' ' > "$ASSET_DIR/dist_traveled_est.txt"
@@ -610,12 +629,15 @@ L2_DIST_KM=1500000
 cat > dist_estimate.py << 'PYEOF'
 import sys
 import time
+import math
 
 launch_epoch = float(sys.argv[1])
 journey_total_days = float(sys.argv[2])
 seed_km = float(sys.argv[3])
 l2_dist_km = float(sys.argv[4])
 asset_dir = sys.argv[5]
+anchor_day = float(sys.argv[6])
+anchor_km = float(sys.argv[7])
 
 def write(name, text):
     import os
@@ -627,12 +649,24 @@ def write(name, text):
 def fmt_km(km):
     return f"{km:,.0f} km (est.)"
 
+# Solve dist(t) = A * t^p for p and A from two points: the anchor
+# (real published NASA figure) and L2 arrival at journey_total_days.
+# Falls back to p=1 (straight-line/linear) if the anchor is degenerate
+# (e.g. set to day 0) so this never divides by zero or logs a
+# non-positive number.
+if anchor_day > 0 and anchor_km > 0 and journey_total_days > anchor_day:
+    p = math.log(l2_dist_km / anchor_km) / math.log(journey_total_days / anchor_day)
+    A = anchor_km / (anchor_day ** p)
+else:
+    p = 1.0
+    A = l2_dist_km / journey_total_days
+
 while True:
-    elapsed = max(0.0, time.time() - launch_epoch)
-    total_s = journey_total_days * 86400.0
-    frac = min(1.0, elapsed / total_s) if total_s > 0 else 1.0
-    eased = 3 * frac**2 - 2 * frac**3  # smoothstep easing
-    dist_from_earth = l2_dist_km * eased
+    elapsed_s = max(0.0, time.time() - launch_epoch)
+    elapsed_days = elapsed_s / 86400.0
+    capped_days = min(elapsed_days, journey_total_days)
+    dist_from_earth = A * (capped_days ** p) if capped_days > 0 else 0.0
+    dist_from_earth = min(dist_from_earth, l2_dist_km)
     dist_traveled = seed_km + dist_from_earth * 1.08  # route-inefficiency factor
     write("dist_from_earth_est", fmt_km(dist_from_earth))
     write("dist_traveled_est", fmt_km(dist_traveled))
@@ -640,6 +674,7 @@ while True:
 PYEOF
 (
     python3 dist_estimate.py "$ROMAN_LAUNCH_EPOCH_S" "$JOURNEY_TOTAL_DAYS" "$ROMAN_DISTANCE_TRAVELED_SEED_KM" "$L2_DIST_KM" "$ASSET_DIR" \
+        "$ROMAN_DIST_ANCHOR_DAY" "$ROMAN_DIST_ANCHOR_KM" \
         2>/tmp/dist_estimate_err.log || echo "WARNING: distance estimator stopped — $(tail -1 /tmp/dist_estimate_err.log 2>/dev/null)"
 ) &
 DISTEST_PID=$!
@@ -745,7 +780,7 @@ trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/nul
 #############################################
 # Static panel text (unchanged across videos)
 #############################################
-printf 'N A N C Y  G R A C E  R O M A N'   > "$ASSET_DIR/title1.txt"
+printf 'N A N C Y   G R A C E   R O M A N'   > "$ASSET_DIR/title1.txt"
 printf 'S P A C E   T E L E S C O P E'       > "$ASSET_DIR/title2.txt"
 printf "T O D A Y ' S   M I S S I O N   U P D A T E" > "$ASSET_DIR/header.txt"
 printf 'LIVE · JOURNEY TO L2'                > "$ASSET_DIR/eyebrow.txt"
@@ -1220,12 +1255,24 @@ prepare_video_content() {
     NOW_S_FOR_BAR=$(date -u +%s)
     local ELAPSED_S_FOR_BAR=$((NOW_S_FOR_BAR - ROMAN_LAUNCH_EPOCH_S))
     [ "$ELAPSED_S_FOR_BAR" -lt 0 ] && ELAPSED_S_FOR_BAR=0
-    # Smoothstep-eased fraction (same curve as the distance estimator
-    # above) rather than a straight elapsed/total ratio, so this bar,
+    # Same calibrated power-law curve as the distance estimator above
+    # (dist(t) = A*t^p, anchored to a real NASA figure) rather than a
+    # straight elapsed/total ratio or a generic S-curve, so this bar,
     # the CRUISE PROGRESS pie further down, and the DIST. FROM EARTH
-    # estimate all agree with each other instead of implying two
+    # estimate all agree with each other instead of implying three
     # different "how far along" numbers.
-    EASED_FRAC=$(awk -v e="$ELAPSED_S_FOR_BAR" -v t="$JOURNEY_TOTAL_SECONDS" 'BEGIN{f=e/t; if(f>1)f=1; if(f<0)f=0; eased=3*f*f-2*f*f*f; printf "%.6f", eased}')
+    EASED_FRAC=$(python3 -c "
+import math
+elapsed_days = min($ELAPSED_S_FOR_BAR / 86400.0, $JOURNEY_TOTAL_DAYS)
+anchor_day, anchor_km, total_days, l2_km = $ROMAN_DIST_ANCHOR_DAY, $ROMAN_DIST_ANCHOR_KM, $JOURNEY_TOTAL_DAYS, $L2_DIST_KM
+if anchor_day > 0 and anchor_km > 0 and total_days > anchor_day:
+    p = math.log(l2_km / anchor_km) / math.log(total_days / anchor_day)
+    A = anchor_km / (anchor_day ** p)
+else:
+    p, A = 1.0, l2_km / total_days
+dist = A * (elapsed_days ** p) if elapsed_days > 0 else 0.0
+print(min(dist / l2_km, 1.0))
+")
     local CM4_FILL_W
     CM4_FILL_W=$(awk -v w="$CM4_BAR_W" -v f="$EASED_FRAC" 'BEGIN{printf "%d", w*f}')
     [ "$CM4_FILL_W" -gt "$CM4_BAR_W" ] && CM4_FILL_W=$CM4_BAR_W
