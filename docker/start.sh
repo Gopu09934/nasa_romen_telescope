@@ -1350,29 +1350,25 @@ print(min(dist / l2_km, 1.0))
         fi
     done
 
-    # ---------------- Left panel: animated "MISSION ACTIVITY" bar graph ----------------
+    # ---------------- Left panel: real audio-reactive "AUDIO ACTIVITY" graph ----------------
+    # Previously a fake sine-wave equalizer — now genuinely driven by
+    # the background audio track (input [2:a], the same stream mapped
+    # to the output audio) via ffmpeg's own showfreqs filter, so the
+    # bars actually move with the music instead of faking it. On a
+    # silent/anullsrc fallback (no AUDIO_URL tracks downloaded) this
+    # honestly renders flat, which is the correct behavior.
     local GRAPH_LABEL_Y=$((DOTS_Y + 40))
-    local GRAPH_BASE_Y=$((GRAPH_LABEL_Y + 160))
-    local BAR_COUNT=14
-    local BAR_W=13
-    local BAR_GAP=6
-    local BAR_MINH=8
-    local BAR_MAXH=100
+    local GRAPH_W=260
+    local GRAPH_H=100
+    local GRAPH_BASE_Y=$((GRAPH_LABEL_Y + 20 + GRAPH_H))
 
     CHAIN+="[${prev}]drawbox=x=$((TEXT_INSET - 2)):y=$((GRAPH_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill:enable='lt(mod(t\,1.4)\,0.9)'[sa1];"
-    CHAIN+="[sa1]drawtext=fontfile=${FONT}:text='MISSION ACTIVITY':fontcolor=white@0.55:fontsize=11:x=$((TEXT_INSET + 14)):y=$((GRAPH_LABEL_Y - 8))[sa2];"
-    CHAIN+="[sa2]drawtext=fontfile=${FONT}:text='%{eif\:64+24*sin(2*PI*t/11)\:d} PCT':fontcolor=${GOLD}:fontsize=16:x=${TEXT_INSET}:y=$((GRAPH_LABEL_Y + 10)):${SHADOW}[sa3];"
-    prev="sa3"
+    CHAIN+="[sa1]drawtext=fontfile=${FONT}:text='AUDIO ACTIVITY (live)':fontcolor=white@0.55:fontsize=11:x=$((TEXT_INSET + 14)):y=$((GRAPH_LABEL_Y - 8))[sa2];"
+    prev="sa2"
 
-    local bi bx h_expr y_expr bnxt
-    for ((bi = 0; bi < BAR_COUNT; bi++)); do
-        bx=$((TEXT_INSET + bi * (BAR_W + BAR_GAP)))
-        h_expr="clip(60+38*sin(2*PI*t/3.1+${bi}*0.55)+18*sin(2*PI*t/1.6+${bi}*0.9)\,${BAR_MINH}\,${BAR_MAXH})"
-        y_expr="${GRAPH_BASE_Y}-(${h_expr})"
-        bnxt="sabar${bi}"
-        CHAIN+="[${prev}]drawbox=x=${bx}:y='${y_expr}':w=${BAR_W}:h='${h_expr}':color=${GOLD}@0.8:t=fill[${bnxt}];"
-        prev="$bnxt"
-    done
+    CHAIN+="[2:a]aformat=channel_layouts=stereo,showfreqs=size=${GRAPH_W}x${GRAPH_H}:mode=bar:cmode=combined:ascale=log:fscale=log:win_size=1024:colors=${GOLD}[freqviz];"
+    CHAIN+="[${prev}][freqviz]overlay=x=${TEXT_INSET}:y=$((GRAPH_LABEL_Y + 20)):shortest=1[sabars];"
+    prev="sabars"
     CHAIN+="[${prev}]drawbox=x=${TEXT_INSET}:y=${GRAPH_BASE_Y}:w=${PANEL_TEXT_W}:h=1:color=white@0.2:t=fill[sabase];"
     prev="sabase"
 
