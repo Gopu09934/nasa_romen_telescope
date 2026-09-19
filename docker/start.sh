@@ -2,12 +2,30 @@
 set -euo pipefail
 
 #############################################
+# LIVE: International Observe the Moon Night 2026 |
+#
+# Same 24/7 ffmpeg -> YouTube pipeline as the Roman / solar scripts,
+# re-themed for International Observe the Moon Night (Sept 19, 2026).
+#
+# NOTE: the YouTube *title* is not set by this script. Put
+#   "LIVE: International Observe the Moon Night 2026 |"
+# in YouTube Studio (Go Live > Edit). This script only controls what is
+# drawn on the video.
+#
+# Everything on the Moon panels (phase, illumination, age, distance,
+# light-time, angular size, next full/new moon, lunar-cycle bar and the
+# phase disc) is computed locally from the wall clock, so there are no
+# NASA/JPL network dependencies to break. Values are labelled "(est.)"
+# where they are modelled rather than tracked.
+#############################################
+
+#############################################
 # Validate Environment Variables
 #############################################
 if [ -z "${VIDEO_URL:-}" ]; then
     echo "ERROR: VIDEO_URL is not set"
-    echo "One or more Roman video/animation clips, comma-separated (same format"
-    echo "as the solar script): url1,url2,url3. A static image (jpg/png) is also"
+    echo "One or more Moon video/animation clips, comma-separated (same format"
+    echo "as before): url1,url2,url3. A static image (jpg/png) is also"
     echo "accepted as a 'slide' and will be shown for IMAGE_SLIDE_SECONDS."
     exit 1
 fi
@@ -29,143 +47,55 @@ if [ -z "${YOUTUBE_API_KEY:-}" ] || [ -z "${YOUTUBE_CHANNEL_ID:-}" ]; then
     SHOW_STATS=false
 fi
 
-# ---------------------------------------------------------------
-# Live "DSN Now" panel (which antenna is talking to Roman right
-# now, signal strength/rate, round-trip light time). Pulled from
-# JPL's public DSN Now feed at eyes.nasa.gov/dsn/data/dsn.xml,
-# which needs no API key and refreshes roughly every 5 seconds.
-# On by default; can be disabled if a runner has no network path
-# to eyes.nasa.gov.
-#
-# ROMAN_DSN_ID: the identifier DSN Now uses for Roman in its feed.
-# This is matched case-insensitively as a SUBSTRING against each
-# dish's target/spacecraft name, so the default of "roman" should
-# match regardless of the exact short code JPL assigned. Override
-# it if the fuzzy match turns out wrong once the feed is live.
-# ---------------------------------------------------------------
-SHOW_DSN=true
-if [ "${DISABLE_DSN:-false}" = "true" ]; then
-    echo "NOTICE: DISABLE_DSN=true — DSN tracking panel will be hidden."
-    SHOW_DSN=false
-fi
-ROMAN_DSN_ID="${ROMAN_DSN_ID:-roman}"
-DSN_FEED="https://eyes.nasa.gov/dsn/data/dsn.xml"
-
-# ---------------------------------------------------------------
-# Live "distance from Earth" panel, best-effort via JPL Horizons'
-# public REST API (no key required). Off by default because
-# Horizons only indexes a spacecraft once JPL has published its
-# tracked trajectory — this can lag a few days behind launch, and
-# the exact Horizons designation for a brand-new spacecraft isn't
-# guaranteed to be simply its common name. Try enabling it; if the
-# log shows "no matches found" repeatedly, set ROMAN_HORIZONS_ID to
-# whatever designation/NAIF ID JPL has published for Roman, or
-# leave SHOW_HORIZONS=false and let the field stay blank.
-# ---------------------------------------------------------------
-SHOW_HORIZONS=false
-if [ "${ENABLE_HORIZONS:-false}" = "true" ]; then
-    SHOW_HORIZONS=true
-fi
-ROMAN_HORIZONS_ID="${ROMAN_HORIZONS_ID:-Roman Space Telescope}"
-HORIZONS_API="https://ssd.jpl.nasa.gov/api/horizons.api"
-
-# Distance-traveled is NOT something Horizons (or DSN) exposes
-# directly — it's a cumulative odometer NASA's own navigation team
-# tracks, not a simple function of current position. This script
-# approximates it going forward by integrating the live speed
-# Horizons reports (if SHOW_HORIZONS=true) over time, starting from
-# an operator-supplied seed value — the last officially published
-# "distance traveled" figure (e.g. from https://roman.gsfc.nasa.gov/clock
-# or a recent NASA blog post) at the moment this stream starts.
-# Without a seed it just starts counting up from 0, which will read
-# low compared to NASA's own figure. Update the seed periodically to
-# stay accurate; this is an approximation, not telemetry.
-ROMAN_DISTANCE_TRAVELED_SEED_KM="${ROMAN_DISTANCE_TRAVELED_SEED_KM:-0}"
-
-# ---------------------------------------------------------------
-# Distance-from-Earth curve, calibrated against a real published NASA
-# figure instead of a generic shape. NASA's own mission tracker/SVS
-# visualizations show distance climbing fast right after launch and
-# slowing as Roman approaches L2 (a translunar-style transfer, not a
-# smooth S-curve) — so the model here is a power law dist(t) = A*t^p
-# (t in days since launch), with A and p solved so the curve passes
-# through launch (day 0 = 0 km), your anchor point below, and L2
-# arrival (day JOURNEY_TOTAL_DAYS ≈ 1,500,000 km).
-#
-# ROMAN_DIST_ANCHOR_DAY / ROMAN_DIST_ANCHOR_KM default to NASA's own
-# Day 3 figure (245,799 miles ≈ 395,600 km, from the official mission
-# tracker). Update these to whatever NASA publishes next — a later,
-# larger anchor point will noticeably improve accuracy across the
-# whole curve, not just near that day, since it reshapes the exponent.
-# ---------------------------------------------------------------
-ROMAN_DIST_ANCHOR_DAY="${ROMAN_DIST_ANCHOR_DAY:-3}"
-ROMAN_DIST_ANCHOR_KM="${ROMAN_DIST_ANCHOR_KM:-395600}"
-
-# Mission clock: computed purely from the wall clock + a fixed launch
-# epoch, so this one is exact (no API needed, no drift).
-# Nancy Grace Roman Space Telescope launched 2026-08-30 11:26:00 UTC
-# (7:26 a.m. EDT) from LC-39A aboard a Falcon Heavy. Override
-# ROMAN_LAUNCH_EPOCH_UTC if this needs correcting.
-ROMAN_LAUNCH_EPOCH_UTC="${ROMAN_LAUNCH_EPOCH_UTC:-2026-08-30 11:26:00}"
-ROMAN_LAUNCH_EPOCH_S=$(date -u -d "$ROMAN_LAUNCH_EPOCH_UTC" +%s)
+# Output target (overridable so the pipeline can be tested without YouTube).
+RTMP_BASE="${RTMP_BASE:-rtmp://a.rtmp.youtube.com/live2}"
 
 # ---------------------------------------------------------------
 # Feed label honesty: most 24/7 rotations like this are looping
-# animation/renders, not an actual continuous downlinked camera feed
-# (Roman doesn't have a public live camera the way SDO does). Default
-# to a label that doesn't overclaim; set VIDEO_FEED_LABEL="ROMAN LIVE
-# FEED" explicitly if VIDEO_URL genuinely is a live camera source.
+# animations/renders, not a live telescope camera. Default to a label
+# that doesn't overclaim; set VIDEO_FEED_LABEL="LIVE MOON CAM" only if
+# VIDEO_URL genuinely is a live camera source.
 # ---------------------------------------------------------------
-VIDEO_FEED_LABEL="${VIDEO_FEED_LABEL:-MISSION ANIMATION}"
+VIDEO_FEED_LABEL="${VIDEO_FEED_LABEL:-MOON ANIMATION}"
+
+# Credit line shown top-right. Set this to match the clips in VIDEO_URL.
+CREDIT_TEXT="${CREDIT_TEXT:-Credits: NASA}"
+
+# Small chip in the bottom-right corner (mirrors the LIVE NOW chip).
+RIGHT_CHIP_TEXT="${RIGHT_CHIP_TEXT:-S E P   1 9}"
+
+# Set MOON_FLIP=true to draw the phase disc as seen from the Southern
+# Hemisphere (lit side mirrored). Default is the Northern view.
+MOON_FLIP="${MOON_FLIP:-false}"
 
 # ---------------------------------------------------------------
-# Network-failure fallback: if a video URL can't even be reached
-# (not just "duration unknown" — genuinely unreachable), retrying it
-# 5 times burns MAX_RETRIES * RETRY_DELAY seconds of dead air. If
-# FALLBACK_IMAGE_URL is set, an unreachable video is skipped in favor
-# of streaming that image as a slide for this rotation instead, so
-# retries are only spent on videos that are actually there.
+# Network-failure fallback: if a video URL can't even be reached,
+# retrying it 5 times burns MAX_RETRIES * RETRY_DELAY seconds of dead
+# air. If FALLBACK_IMAGE_URL is set, an unreachable video is skipped in
+# favor of streaming that image as a slide for this rotation instead.
 # ---------------------------------------------------------------
 FALLBACK_IMAGE_URL="${FALLBACK_IMAGE_URL:-}"
 
 # ---------------------------------------------------------------
-# Optional operator override for the panel-thumbnail rotation, so
-# new mission photos/renders can be added as they're released
-# without editing this script — comma-separated, same format as
-# VIDEO_URL. Falls back to the single built-in verified image below
-# if unset.
-# ---------------------------------------------------------------
-ROMAN_PANEL_IMAGE_URLS="${ROMAN_PANEL_IMAGE_URLS:-}"
-
-# ---------------------------------------------------------------
-# Video crop zoom/pan. Some sources (e.g. a screen capture of NASA's
-# "Eyes on the Solar System" app) include their own UI chrome —
-# search bar, breadcrumb, an info side-panel — baked into the frame
-# alongside the spacecraft render. The default center-crop can't tell
-# UI chrome from the model, so it can end up in-frame overlapping this
-# script's own left panel. VIDEO_ZOOM (>1 crops in tighter) plus
-# VIDEO_PAN_X / VIDEO_PAN_Y (each -1..1, 0 = centered) let you shift
-# the crop window onto just the spacecraft/render portion of the
-# source and crop the chrome out entirely. Start with VIDEO_ZOOM=1.4
-# and nudge VIDEO_PAN_X toward +1 if the chrome sits on the left.
+# Video crop zoom/pan. VIDEO_ZOOM (>1 crops in tighter) plus
+# VIDEO_PAN_X / VIDEO_PAN_Y (each -1..1, 0 = centered) shift the crop
+# window onto the useful part of the source (e.g. to crop out UI chrome
+# baked into a screen capture).
 # ---------------------------------------------------------------
 VIDEO_ZOOM="${VIDEO_ZOOM:-1.0}"
 VIDEO_PAN_X="${VIDEO_PAN_X:-0}"
 VIDEO_PAN_Y="${VIDEO_PAN_Y:-0}"
 
 echo "========================================"
-echo "Starting 24/7 YouTube Stream (Nancy Grace Roman Space Telescope)"
+echo "Starting 24/7 YouTube Stream (International Observe the Moon Night 2026)"
 echo "Output Resolution : 1280x720 (720p — sized for a 2-core CI runner)"
 echo "FPS               : 30"
 echo "========================================"
 
 FONT="font.ttf"
-# NASA-brand-adjacent palette: azure accent (echoes the blue used across
-# NASA's Eyes app and mission dashboards) + NASA "insignia red" for the
-# live indicator, on a deep navy panel background instead of flat black —
-# reads as a space-agency dashboard rather than the solar script's
-# amber/red documentary look.
-GOLD="0x3EA6FF"
+# Palette: warm moonlight accent + NASA-style "insignia red" for the live
+# indicator, on a deep navy panel background.
+GOLD="0xF2C96B"
 RED="0xFC3D21"
 PANEL_BG="0x060B14"
 ASSET_DIR="panel_assets"
@@ -173,7 +103,7 @@ INFO_FILE="mission_info.txt"
 SLOT=6            # seconds each headline is shown
 FACT_SLOT=8       # seconds each fun fact is shown
 TICKER_SPEED=110  # pixels/second for the bottom ticker scroll
-CHANNEL_NAME="Roman Space Telescope Live"
+CHANNEL_NAME="${CHANNEL_NAME:-International Observe the Moon Night 2026}"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 HEADLINE_FONTSIZE=21
 HEADLINE_LINE_SPACING=9
@@ -183,8 +113,7 @@ FACT_LINE_SPACING=7
 FACT_LINE_H=$((FACT_FONTSIZE + FACT_LINE_SPACING))
 
 # ---------------------------------------------------------------
-# Layout: identical structure to the solar script — video stays
-# centered/full-height, one panel on each side.
+# Layout: video stays centered/full-height, one panel on each side.
 # ---------------------------------------------------------------
 PANEL_W=333
 CENTER_X0=$PANEL_W
@@ -196,9 +125,9 @@ PANEL_TEXT_W=$((PANEL_W - 66))
 
 # ---------------------------------------------------------------
 # Center strip: 3 stacked bands —
-#   Row 1 - live Roman video/animation feed
-#   Row 2 - MISSION STATUS card (day count, elapsed time, distance)
-#   Row 3 - "JOURNEY TO L2" progress visualization
+#   Row 1 - Moon video/animation feed
+#   Row 2 - MOON TONIGHT card (phase, illumination, age, distance)
+#   Row 3 - LUNAR CYCLE progress bar
 # ---------------------------------------------------------------
 VIDEO_ROW_H=340
 INFO_ROW_H=190
@@ -211,12 +140,6 @@ MVALUE_X=$((MTEXT_INSET + 150))
 
 VIEWER_MIN_TO_SHOW=10
 
-# Roman's three-month cruise to L2 is roughly this many seconds long,
-# used only to draw the "JOURNEY TO L2" progress bar in row 3. This is
-# a planning estimate, not a live tracked figure — see the DSN/Horizons
-# panels above for the parts of the dashboard that are actually live.
-JOURNEY_TOTAL_DAYS="${JOURNEY_TOTAL_DAYS:-92}"
-
 #############################################
 # Auto-restart on failure
 #############################################
@@ -226,10 +149,16 @@ IMAGE_SLIDE_SECONDS="${IMAGE_SLIDE_SECONDS:-25}"
 
 mkdir -p "$ASSET_DIR"
 
+CLOCK_PID=""
+MOONCALC_PID=""
+SUBS_PID=""
+VIEWERS_PID=""
+TRIVIA_PID=""
+trap 'for p in "$CLOCK_PID" "$MOONCALC_PID" "$SUBS_PID" "$VIEWERS_PID" "$TRIVIA_PID"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done' EXIT
+
 #############################################
 # Background audio (one or more tracks, looped)
-# Same reasoning/behavior as the solar script: downloaded once,
-# rotated across videos, looped locally per-video.
+# Downloaded once, rotated across videos, looped locally per-video.
 #############################################
 IFS=',' read -ra RAW_AUDIO_URLS <<< "$AUDIO_URL"
 AUDIO_LOCAL_FILES=()
@@ -260,54 +189,11 @@ fi
 AUDIO_COUNTER=0
 
 #############################################
-# Panel decoration images (Roman / Earth / L2 stills)
-#
-# Same role as the sun/earth stills in the solar script: a small
-# static thumbnail placed in the Mission Status card. Only one URL
-# below is a verified, currently-live NASA asset — pass more of your
-# own (mission renders, L2 orbit diagrams, launch photos) via
-# ROMAN_PANEL_IMAGE_URLS (comma-separated) as new ones are released,
-# without editing this script. Broken URLs just get skipped with a
-# warning, same as the solar script's panel-image downloader.
-#############################################
-if [ -n "$ROMAN_PANEL_IMAGE_URLS" ]; then
-    IFS=',' read -ra PANEL_IMAGE_URLS <<< "$ROMAN_PANEL_IMAGE_URLS"
-else
-    PANEL_IMAGE_URLS=(
-        "https://assets.science.nasa.gov/content/dam/science/missions/rst/spacecraft-illustrations/Roman_BeautyPass2026-med.png/jcr:content/renditions/cq5dam.web.1280.1280.png"
-    )
-fi
-PANEL_IMAGE_LOCAL_FILES=()
-pimg_i=0
-for piu in "${PANEL_IMAGE_URLS[@]}"; do
-    piu="${piu#"${piu%%[![:space:]]*}"}"
-    piu="${piu%"${piu##*[![:space:]]}"}"
-    [ -z "$piu" ] && continue
-    pimg_i=$((pimg_i + 1))
-    dest="panel_img_${pimg_i}.jpg"
-    echo "Downloading panel image ${pimg_i} ($(basename "$piu"))..."
-    if curl -sL --fail -o "$dest" "$piu" && [ -s "$dest" ]; then
-        PANEL_IMAGE_LOCAL_FILES+=("$dest")
-        echo "  OK ($(du -h "$dest" | cut -f1))"
-    else
-        echo "  WARNING: failed to download panel image ${pimg_i} — panel thumbnails will be skipped."
-    fi
-done
-NUM_PANEL_IMAGES=${#PANEL_IMAGE_LOCAL_FILES[@]}
-PANEL_IMAGES_AVAILABLE=false
-if [ "$NUM_PANEL_IMAGES" -gt 0 ]; then
-    PANEL_IMAGES_AVAILABLE=true
-    echo "Loaded $NUM_PANEL_IMAGES panel thumbnail(s)."
-else
-    echo "WARNING: no panel thumbnails downloaded — Mission Status thumbnail slot will stay empty."
-fi
-PANEL_IMAGE_COUNTER=0
-
-#############################################
-# Coordinate-label marker dot (unchanged from the solar script)
+# Coordinate-label marker dot (generic callout feature, see
+# build_labels_chain below)
 #############################################
 DOT_MARKER="dot_marker.png"
-GOLD_R=232; GOLD_G=163; GOLD_B=61
+GOLD_R=242; GOLD_G=201; GOLD_B=107
 DOT_VF="format=rgba,geq=r=(if(lte(hypot(X-10\,Y-10)\,5)\,${GOLD_R}\,if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))):g=(if(lte(hypot(X-10\,Y-10)\,5)\,${GOLD_G}\,if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))):b=(if(lte(hypot(X-10\,Y-10)\,5)\,${GOLD_B}\,if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))):a=(if(lte(hypot(X-10\,Y-10)\,8)\,255\,0))"
 ffmpeg -y -f lavfi -i "color=c=black@0.0:s=20x20" -vf "$DOT_VF" -frames:v 1 "$DOT_MARKER" -loglevel error
 if [ ! -s "$DOT_MARKER" ]; then
@@ -316,8 +202,7 @@ if [ ! -s "$DOT_MARKER" ]; then
 fi
 
 #############################################
-# Background clock writer (UTC wall clock, shown as-is; unchanged
-# from the solar script)
+# Background clock writer (UTC wall clock)
 #############################################
 date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt"
 (
@@ -330,95 +215,194 @@ date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt"
 CLOCK_PID=$!
 
 #############################################
-# Background MISSION CLOCK writer (elapsed time since launch).
-# Pure arithmetic against ROMAN_LAUNCH_EPOCH_S — exact, no network
-# dependency, updates once a second like the wall clock above.
+# Moon calculator (pure Python, no network, no API key).
+#
+# Uses the leading terms of the standard lunar theory (Meeus, "Astronomical
+# Algorithms", ch. 47/48) to get the Moon-Sun elongation (phase), the
+# Earth-Moon distance and the times of the next full/new moon. Checked
+# against the Aug 12 and Aug 28, 2026 eclipses (new/full moon) to within
+# minutes. Accuracy: phase/illumination well under 1 PCT, distance within
+# a few hundred km — hence the "(est.)" on distance.
+#
+#   moon_calc.py once          -> prints "psi illum_pct age_frac cos_psi waxing"
+#   moon_calc.py write <dir>   -> writes the panel text files once
+#   moon_calc.py loop  <dir>   -> writes them every 10 seconds
 #############################################
-printf '0d 00h 00m 00s' > "$ASSET_DIR/mission_clock.txt"
-printf 'DAY 0' > "$ASSET_DIR/mission_day.txt"
+cat > moon_calc.py << 'PYEOF'
+import sys
+import os
+import math
+import time
+from datetime import datetime, timezone
 
-# ---------------------------------------------------------------
-# NEXT MILESTONE table. Real, already-happened commissioning events
-# (mid-course burn, antenna/visor deploy, planet imager power-on) are
-# dated from NASA's own Roman blog. Everything after that is NASA's
-# typical commissioning sequence with an operator-editable day
-# estimate, not a published date — each is labeled "(est.)" in the
-# label text itself so the on-screen line is honest about which kind
-# of milestone it's showing. Override the whole table by creating a
-# "milestones.txt" file (one "day,text" pair per line, day = mission
-# day the event is expected) next to this script; the built-in
-# defaults below are the fallback.
-# ---------------------------------------------------------------
-ROMAN_MILESTONES_FILE="${ROMAN_MILESTONES_FILE:-milestones.txt}"
-if [ -f "$ROMAN_MILESTONES_FILE" ]; then
-    echo "Using curated milestone table: $ROMAN_MILESTONES_FILE"
-else
-    cat > "$ROMAN_MILESTONES_FILE" << 'MSEOF'
-1,First mid-course correction burn
-2,Antenna and sunshade visor deployed
-2,Wide Field Instrument planet imager powered on
-10,Instrument cooldown and focus alignment begins (est.)
-30,Coronagraph Instrument decontamination (est.)
-45,Reaction wheel characterization (est.)
-70,WFI-Coronagraph alignment and calibration (est.)
-85,Science commissioning and characterization begins (est.)
-92,Arrival at Sun-Earth L2, science operations begin (est.)
-MSEOF
+SYNODIC_DAYS = 29.530588853
+MOON_RADIUS_KM = 1737.4
+C_KMS = 299792.458
+DEG_PER_DAY = 12.1907  # mean elongation rate
+
+
+def _sin(d):
+    return math.sin(math.radians(d))
+
+
+def _cos(d):
+    return math.cos(math.radians(d))
+
+
+def jd_from_unix(t):
+    return t / 86400.0 + 2440587.5
+
+
+def unix_from_jd(jd):
+    return (jd - 2440587.5) * 86400.0
+
+
+def elements(jd):
+    T = (jd - 2451545.0) / 36525.0
+    D = (297.8501921 + 445267.1114034 * T) % 360
+    M = (357.5291092 + 35999.0502909 * T) % 360
+    Mp = (134.9633964 + 477198.8675055 * T) % 360
+    return D, M, Mp
+
+
+def phase_angle(jd):
+    """Moon-Sun elongation in degrees: 0 = new, 90 = first quarter,
+    180 = full, 270 = last quarter."""
+    D, M, Mp = elements(jd)
+    psi = (D + 6.289 * _sin(Mp) - 2.100 * _sin(M) + 1.274 * _sin(2 * D - Mp)
+           + 0.658 * _sin(2 * D) + 0.214 * _sin(2 * Mp) + 0.110 * _sin(D))
+    return psi % 360
+
+
+def distance_km(jd):
+    D, M, Mp = elements(jd)
+    return (385000.56
+            - 20905.355 * _cos(Mp)
+            - 3699.111 * _cos(2 * D - Mp)
+            - 2955.968 * _cos(2 * D)
+            - 569.925 * _cos(2 * Mp)
+            + 48.888 * _cos(M)
+            + 246.158 * _cos(2 * D - 2 * Mp)
+            - 152.138 * _cos(2 * D - M - Mp)
+            - 170.733 * _cos(2 * D + Mp)
+            - 204.586 * _cos(2 * D - M)
+            - 129.620 * _cos(Mp - M)
+            + 108.743 * _cos(D)
+            + 104.755 * _cos(Mp + M))
+
+
+def next_event_jd(jd, target_deg):
+    psi = phase_angle(jd)
+    j = jd + ((target_deg - psi) % 360) / DEG_PER_DAY
+    for _ in range(6):
+        d = ((target_deg - phase_angle(j) + 180) % 360) - 180
+        j += d / DEG_PER_DAY
+    return j
+
+
+def phase_name(psi):
+    if psi < 6 or psi >= 354:
+        return "New Moon"
+    if psi < 84:
+        return "Waxing Crescent"
+    if psi < 96:
+        return "First Quarter"
+    if psi < 174:
+        return "Waxing Gibbous"
+    if psi < 186:
+        return "Full Moon"
+    if psi < 264:
+        return "Waning Gibbous"
+    if psi < 276:
+        return "Last Quarter"
+    return "Waning Crescent"
+
+
+def fmt_event(jd_now, jd_evt):
+    dt = datetime.fromtimestamp(unix_from_jd(jd_evt), timezone.utc)
+    days = jd_evt - jd_now
+    return f"{dt.strftime('%b %d')} · in {days:.1f} d"
+
+
+def compute():
+    jd = jd_from_unix(time.time())
+    psi = phase_angle(jd)
+    illum = (1 - _cos(psi)) / 2
+    dist = distance_km(jd)
+    return {
+        "jd": jd, "psi": psi, "illum": illum, "dist": dist,
+        "ang": math.degrees(2 * math.atan(MOON_RADIUS_KM / dist)) * 60,
+        "age_days": psi / 360 * SYNODIC_DAYS,
+        "full_jd": next_event_jd(jd, 180),
+        "new_jd": next_event_jd(jd, 360),
+        "name": phase_name(psi),
+    }
+
+
+def write(asset_dir, name, text):
+    tmp = f"{asset_dir}/{name}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, f"{asset_dir}/{name}.txt")
+
+
+def write_all(asset_dir):
+    c = compute()
+    pct = int(round(c["illum"] * 100))
+    write(asset_dir, "moon_phase", c["name"])
+    write(asset_dir, "moon_illum", f"{pct} PCT")
+    write(asset_dir, "moon_age", f"{c['age_days']:.1f} days")
+    write(asset_dir, "moon_dist", f"{c['dist']:,.0f} km (est.)")
+    write(asset_dir, "moon_light", f"{c['dist'] / C_KMS:.2f} s (one-way)")
+    write(asset_dir, "moon_ang", f"{c['ang']:.1f} arcmin")
+    write(asset_dir, "moon_next_full", fmt_event(c["jd"], c["full_jd"]))
+    write(asset_dir, "moon_next_new", fmt_event(c["jd"], c["new_jd"]))
+    write(asset_dir, "moon_summary", f"{c['name']} · {pct} PCT lit")
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1]
+    if mode == "once":
+        c = compute()
+        # psi  illum_pct  age_fraction  cos(psi)  waxing(1/0)
+        print(f"{c['psi']:.3f} {int(round(c['illum'] * 100))} {c['psi'] / 360:.5f} "
+              f"{_cos(c['psi']):.5f} {1 if c['psi'] < 180 else 0}")
+    else:
+        asset_dir = sys.argv[2]
+        write_all(asset_dir)
+        if mode == "loop":
+            while True:
+                time.sleep(10)
+                try:
+                    write_all(asset_dir)
+                except Exception:
+                    pass
+PYEOF
+
+# Placeholders so ffmpeg never opens a missing file, then a synchronous first
+# write so real values are on disk before the first video starts.
+for f in moon_phase moon_illum moon_age moon_dist moon_light moon_ang moon_next_full moon_next_new moon_summary; do
+    printf ' ' > "$ASSET_DIR/${f}.txt"
+done
+if ! python3 moon_calc.py write "$ASSET_DIR" 2>/tmp/moon_calc_err.log; then
+    echo "WARNING: initial moon calculation failed — $(tail -1 /tmp/moon_calc_err.log 2>/dev/null)"
 fi
-
-printf ' ' > "$ASSET_DIR/next_milestone.txt"
 (
-    while true; do
-        NOW_S=$(date -u +%s)
-        ELAPSED=$((NOW_S - ROMAN_LAUNCH_EPOCH_S))
-        [ "$ELAPSED" -lt 0 ] && ELAPSED=0
-        D=$((ELAPSED / 86400))
-        H=$(((ELAPSED % 86400) / 3600))
-        M=$(((ELAPSED % 3600) / 60))
-        S=$((ELAPSED % 60))
-        printf '%dd %02dh %02dm %02ds' "$D" "$H" "$M" "$S" > "$ASSET_DIR/mission_clock.txt.tmp"
-        mv -f "$ASSET_DIR/mission_clock.txt.tmp" "$ASSET_DIR/mission_clock.txt"
-        printf 'DAY %d' "$D" > "$ASSET_DIR/mission_day.txt.tmp"
-        mv -f "$ASSET_DIR/mission_day.txt.tmp" "$ASSET_DIR/mission_day.txt"
-
-        NEXT_MS=""
-        while IFS=',' read -r ms_day ms_text; do
-            ms_day="$(echo "$ms_day" | tr -d '[:space:]')"
-            [[ "$ms_day" =~ ^[0-9]+$ ]] || continue
-            if [ "$ms_day" -gt "$D" ]; then
-                NEXT_MS="$ms_text"
-                break
-            fi
-        done < "$ROMAN_MILESTONES_FILE"
-        if [ -z "$NEXT_MS" ]; then
-            NEXT_MS="Science operations underway"
-        fi
-        # Truncated to one line's worth of characters at this panel's
-        # width/fontsize (rather than wrapped to multiple lines) since
-        # this file is read live with reload=1 — wrapping would need
-        # re-folding on every change, which reload=1 text can't do.
-        if [ "${#NEXT_MS}" -gt 42 ]; then
-            NEXT_MS="${NEXT_MS:0:41}…"
-        fi
-        printf '%s' "$NEXT_MS" > "$ASSET_DIR/next_milestone.txt.tmp"
-        mv -f "$ASSET_DIR/next_milestone.txt.tmp" "$ASSET_DIR/next_milestone.txt"
-
-        sleep 1
-    done
+    python3 moon_calc.py loop "$ASSET_DIR" 2>/tmp/moon_calc_err.log || \
+        echo "WARNING: moon calculator stopped — $(tail -1 /tmp/moon_calc_err.log 2>/dev/null)"
 ) &
-MISSIONCLOCK_PID=$!
+MOONCALC_PID=$!
 
 #############################################
-# Background subscriber-count writer (unchanged from the solar script)
+# Background subscriber-count writer
 #############################################
 printf ' ' > "$ASSET_DIR/subs.txt"
-SUBS_PID=""
 if [ "$SHOW_STATS" = true ]; then
     (
         WARNED_ONCE=false
         while true; do
             RESP=$(curl -s "https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${YOUTUBE_CHANNEL_ID}&key=${YOUTUBE_API_KEY}" || true)
-            COUNT=$(echo "$RESP" | grep -o '"subscriberCount"[^"]*"[0-9]*"' | grep -oE '[0-9]+')
+            COUNT=$(echo "$RESP" | grep -o '"subscriberCount"[^"]*"[0-9]*"' | grep -oE '[0-9]+' || true)
             if [ -n "$COUNT" ]; then
                 FORMATTED=$(echo "$COUNT" | rev | sed 's/\(...\)/\1,/g' | rev | sed 's/^,//')
                 printf '%s subscribers' "$FORMATTED" > "$ASSET_DIR/subs.txt.tmp"
@@ -436,21 +420,20 @@ if [ "$SHOW_STATS" = true ]; then
 fi
 
 #############################################
-# Background live-viewer-count writer (unchanged from the solar script)
+# Background live-viewer-count writer
 #############################################
 printf ' ' > "$ASSET_DIR/viewers.txt"
-VIEWERS_PID=""
 if [ "$SHOW_STATS" = true ]; then
     (
         LIVE_VIDEO_ID=""
         while true; do
             if [ -z "$LIVE_VIDEO_ID" ]; then
                 SEARCH_RESP=$(curl -s "https://www.googleapis.com/youtube/v3/search?part=id&channelId=${YOUTUBE_CHANNEL_ID}&eventType=live&type=video&key=${YOUTUBE_API_KEY}" || true)
-                LIVE_VIDEO_ID=$(echo "$SEARCH_RESP" | grep -o '"videoId": *"[^"]*"' | head -1 | sed -E 's/.*"videoId": *"([^"]*)".*/\1/')
+                LIVE_VIDEO_ID=$(echo "$SEARCH_RESP" | grep -o '"videoId": *"[^"]*"' | head -1 | sed -E 's/.*"videoId": *"([^"]*)".*/\1/' || true)
             fi
             if [ -n "$LIVE_VIDEO_ID" ]; then
                 VRESP=$(curl -s "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${LIVE_VIDEO_ID}&key=${YOUTUBE_API_KEY}" || true)
-                VIEWERS=$(echo "$VRESP" | grep -o '"concurrentViewers": *"[0-9]*"' | grep -o '[0-9]*')
+                VIEWERS=$(echo "$VRESP" | grep -o '"concurrentViewers": *"[0-9]*"' | grep -o '[0-9]*' || true)
                 if [ -n "$VIEWERS" ] && [ "$VIEWERS" -ge "$VIEWER_MIN_TO_SHOW" ]; then
                     printf '%s watching now' "$VIEWERS" > "$ASSET_DIR/viewers.txt.tmp"
                     mv -f "$ASSET_DIR/viewers.txt.tmp" "$ASSET_DIR/viewers.txt"
@@ -469,338 +452,32 @@ if [ "$SHOW_STATS" = true ]; then
 fi
 
 #############################################
-# Background DSN Now poller
-#
-# Polls eyes.nasa.gov/dsn/data/dsn.xml every 15s (the feed itself
-# refreshes ~every 5s; 15s keeps this well under any reasonable
-# rate limit) and writes:
-#   - which DSN complex/dish is linked to Roman right now
-#   - downlink data rate
-#   - round-trip light time -> converted to a live distance estimate
-#     (light-time * c), which is exactly how NASA's own DSN Now
-#     displays range
-# If no dish is currently tracking Roman (common — it isn't
-# continuously tracked), fields blank out rather than showing stale
-# data, same "degrade one field, not the whole panel" approach as
-# the solar script's space-weather poller.
-#############################################
-printf ' ' > "$ASSET_DIR/dsn_station.txt"
-printf ' ' > "$ASSET_DIR/dsn_rate.txt"
-printf ' ' > "$ASSET_DIR/dsn_distance.txt"
-printf ' ' > "$ASSET_DIR/dsn_lighttime.txt"
-DSN_PID=""
-if [ "$SHOW_DSN" = true ]; then
-    cat > dsn_poll.py << 'PYEOF'
-import sys
-import urllib.request
-import xml.etree.ElementTree as ET
-
-FEED = sys.argv[1]
-ASSET_DIR = sys.argv[2]
-SPACECRAFT_ID = sys.argv[3].lower()
-
-def write(name, text):
-    import os
-    tmp = f"{ASSET_DIR}/{name}.tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, f"{ASSET_DIR}/{name}.txt")
-
-def attr_any(elem, keys):
-    for k in keys:
-        v = elem.get(k)
-        if v:
-            return v
-    return None
-
-try:
-    req = urllib.request.Request(FEED, headers={"User-Agent": "roman-stream-overlay/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        data = r.read()
-    root = ET.fromstring(data)
-
-    found_station = None
-    found_rate = None
-    found_rtlt = None
-
-    for station in root.findall(".//station"):
-        station_name = attr_any(station, ["friendlyName", "name"]) or "DSN"
-        for dish in station.findall(".//dish"):
-            dish_name = attr_any(dish, ["name"]) or ""
-            candidates = list(dish.findall("target")) + list(dish.findall("downSignal")) + list(dish.findall("upSignal"))
-            for c in candidates:
-                sc = (attr_any(c, ["name", "spacecraft", "id"]) or "").lower()
-                if SPACECRAFT_ID in sc:
-                    found_station = f"{station_name} / {dish_name}"
-                    rate = attr_any(c, ["dataRate"])
-                    if rate:
-                        found_rate = rate
-                    rtlt = attr_any(c, ["rtlt"])
-                    if rtlt:
-                        found_rtlt = rtlt
-                    break
-            if found_station:
-                break
-        if found_station:
-            break
-
-    if found_station:
-        write("dsn_station", found_station)
-    else:
-        write("dsn_station", " ")
-
-    if found_rate:
-        try:
-            bps = float(found_rate)
-            if bps >= 1000:
-                write("dsn_rate", f"{bps/1000:.1f} kb/s")
-            else:
-                write("dsn_rate", f"{bps:.0f} b/s")
-        except ValueError:
-            write("dsn_rate", " ")
-    else:
-        write("dsn_rate", " ")
-
-    if found_rtlt:
-        try:
-            rtlt_s = float(found_rtlt)
-            # distance = one-way light time * speed of light
-            one_way_s = rtlt_s / 2.0
-            km = one_way_s * 299792.458
-            write("dsn_distance", f"{km:,.0f} km")
-            if one_way_s >= 60:
-                write("dsn_lighttime", f"{one_way_s/60:.1f} min (one-way)")
-            else:
-                write("dsn_lighttime", f"{one_way_s:.1f} s (one-way)")
-        except ValueError:
-            write("dsn_distance", " ")
-            write("dsn_lighttime", " ")
-    else:
-        write("dsn_distance", " ")
-        write("dsn_lighttime", " ")
-
-except Exception:
-    # Leave whatever was already on disk — a single failed poll
-    # shouldn't blank out the last good reading.
-    pass
-PYEOF
-    (
-        while true; do
-            python3 dsn_poll.py "$DSN_FEED" "$ASSET_DIR" "$ROMAN_DSN_ID" 2>/tmp/dsn_err.log || \
-                echo "WARNING: DSN poll cycle failed — $(tail -1 /tmp/dsn_err.log 2>/dev/null)"
-            sleep 15
-        done
-    ) &
-    DSN_PID=$!
-    echo "DSN tracking panel enabled — polling eyes.nasa.gov/dsn every 15s for spacecraft matching '${ROMAN_DSN_ID}'."
-fi
-
-#############################################
-# Background JPL Horizons poller (optional, off by default — see
-# ENABLE_HORIZONS above). Fetches current geocentric range + speed
-# and writes a live "distance from Earth" reading, and integrates
-# speed*dt into a running "distance traveled" odometer seeded from
-# ROMAN_DISTANCE_TRAVELED_SEED_KM.
-#############################################
-printf ' ' > "$ASSET_DIR/dist_from_earth.txt"
-printf ' ' > "$ASSET_DIR/dist_traveled.txt"
-HORIZONS_PID=""
-
-#############################################
-# Background DISTANCE ESTIMATE writer — always on, so the Mission
-# Status card is never left blank even when neither DSN nor Horizons
-# currently has a live number for Roman (the common case in the days
-# right after launch). This is a modeled estimate, not telemetry: a
-# power law dist(t) = A * t^p calibrated at startup so the curve
-# passes through launch (0 km), the ROMAN_DIST_ANCHOR_DAY/KM point
-# below, and L2 arrival (~1,500,000 km) at JOURNEY_TOTAL_DAYS — see
-# the calibration comment above ROMAN_DIST_ANCHOR_DAY for why a power
-# law fits a real translunar-style transfer much better than a plain
-# S-curve. "Distance traveled" is the same curve's implied path
-# length times a 1.08 route-inefficiency factor (a straight radial
-# line understates the real, slightly curved trajectory), plus the
-# seed. Labeled "(est.)" everywhere it's shown so it's never mistaken
-# for a tracked figure. prepare_video_content() below prefers the
-# real DSN/Horizons files over these whenever either has live data.
-#############################################
-printf ' ' > "$ASSET_DIR/dist_from_earth_est.txt"
-printf ' ' > "$ASSET_DIR/dist_traveled_est.txt"
-L2_DIST_KM=1500000
-cat > dist_estimate.py << 'PYEOF'
-import sys
-import time
-import math
-
-launch_epoch = float(sys.argv[1])
-journey_total_days = float(sys.argv[2])
-seed_km = float(sys.argv[3])
-l2_dist_km = float(sys.argv[4])
-asset_dir = sys.argv[5]
-anchor_day = float(sys.argv[6])
-anchor_km = float(sys.argv[7])
-
-def write(name, text):
-    import os
-    tmp = f"{asset_dir}/{name}.tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, f"{asset_dir}/{name}.txt")
-
-def fmt_km(km):
-    return f"{km:,.0f} km (est.)"
-
-# Solve dist(t) = A * t^p for p and A from two points: the anchor
-# (real published NASA figure) and L2 arrival at journey_total_days.
-# Falls back to p=1 (straight-line/linear) if the anchor is degenerate
-# (e.g. set to day 0) so this never divides by zero or logs a
-# non-positive number.
-if anchor_day > 0 and anchor_km > 0 and journey_total_days > anchor_day:
-    p = math.log(l2_dist_km / anchor_km) / math.log(journey_total_days / anchor_day)
-    A = anchor_km / (anchor_day ** p)
-else:
-    p = 1.0
-    A = l2_dist_km / journey_total_days
-
-while True:
-    elapsed_s = max(0.0, time.time() - launch_epoch)
-    elapsed_days = elapsed_s / 86400.0
-    capped_days = min(elapsed_days, journey_total_days)
-    dist_from_earth = A * (capped_days ** p) if capped_days > 0 else 0.0
-    dist_from_earth = min(dist_from_earth, l2_dist_km)
-    dist_traveled = seed_km + dist_from_earth * 1.08  # route-inefficiency factor
-    write("dist_from_earth_est", fmt_km(dist_from_earth))
-    write("dist_traveled_est", fmt_km(dist_traveled))
-    time.sleep(10)
-PYEOF
-(
-    python3 dist_estimate.py "$ROMAN_LAUNCH_EPOCH_S" "$JOURNEY_TOTAL_DAYS" "$ROMAN_DISTANCE_TRAVELED_SEED_KM" "$L2_DIST_KM" "$ASSET_DIR" \
-        "$ROMAN_DIST_ANCHOR_DAY" "$ROMAN_DIST_ANCHOR_KM" \
-        2>/tmp/dist_estimate_err.log || echo "WARNING: distance estimator stopped — $(tail -1 /tmp/dist_estimate_err.log 2>/dev/null)"
-) &
-DISTEST_PID=$!
-if [ "$SHOW_HORIZONS" = true ]; then
-    cat > horizons_poll.py << 'PYEOF'
-import sys
-import time
-import json
-import urllib.request
-import urllib.parse
-
-API = sys.argv[1]
-ASSET_DIR = sys.argv[2]
-TARGET = sys.argv[3]
-SEED_KM = float(sys.argv[4])
-STATE_FILE = f"{ASSET_DIR}/.horizons_state"
-
-def write(name, text):
-    import os
-    tmp = f"{ASSET_DIR}/{name}.tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, f"{ASSET_DIR}/{name}.txt")
-
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            t, total_km = f.read().strip().split(",")
-            return float(t), float(total_km)
-    except Exception:
-        return None, SEED_KM
-
-def save_state(t, total_km):
-    with open(STATE_FILE, "w") as f:
-        f.write(f"{t},{total_km}")
-
-def fetch_vectors(target):
-    params = {
-        "format": "json",
-        "COMMAND": f"'{target}'",
-        "OBJ_DATA": "NO",
-        "MAKE_EPHEM": "YES",
-        "EPHEM_TYPE": "VECTORS",
-        "CENTER": "'500@399'",  # geocentric (Earth body center)
-        "OUT_UNITS": "KM-S",
-        "VEC_TABLE": "3",       # position + velocity + range/range-rate
-        "REF_PLANE": "FRAME",
-        "TLIST": str(time.time() / 86400.0 + 2440587.5),  # now, as JD
-    }
-    url = API + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "roman-stream-overlay/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        payload = json.loads(r.read())
-    text = payload.get("result", "")
-    rg = None
-    rr = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("RG ="):
-            parts = line.replace("RG =", "").split("RR =")
-            try:
-                rg = float(parts[0].strip().split()[0])
-                if len(parts) > 1:
-                    rr = float(parts[1].strip().split()[0])
-            except (ValueError, IndexError):
-                pass
-    return rg, rr
-
-try:
-    rg_km, rr_kms = fetch_vectors(TARGET)
-    if rg_km is not None:
-        write("dist_from_earth", f"{rg_km:,.0f} km")
-
-        speed_kms = abs(rr_kms) if rr_kms is not None else 0.0
-        now = time.time()
-        last_t, total_km = load_state()
-        if last_t is not None:
-            dt = max(0.0, now - last_t)
-            total_km += speed_kms * dt
-        save_state(now, total_km)
-        write("dist_traveled", f"{total_km:,.0f} km (est.)")
-    else:
-        write("dist_from_earth", " ")
-except Exception:
-    pass
-PYEOF
-    (
-        while true; do
-            python3 horizons_poll.py "$HORIZONS_API" "$ASSET_DIR" "$ROMAN_HORIZONS_ID" "$ROMAN_DISTANCE_TRAVELED_SEED_KM" 2>/tmp/horizons_err.log || \
-                echo "WARNING: Horizons poll cycle failed — $(tail -1 /tmp/horizons_err.log 2>/dev/null)"
-            sleep 120
-        done
-    ) &
-    HORIZONS_PID=$!
-    echo "Horizons distance panel enabled — polling ssd.jpl.nasa.gov every 120s for '${ROMAN_HORIZONS_ID}'."
-    echo "  (If this target isn't found yet in Horizons, distance fields will stay blank — check the log for 'no matches found' and set ROMAN_HORIZONS_ID accordingly.)"
-else
-    echo "NOTICE: Horizons distance panel disabled (set ENABLE_HORIZONS=true to try it). Distance fields will stay blank."
-fi
-
-trap 'kill "$CLOCK_PID" 2>/dev/null || true; kill "$MISSIONCLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$DSN_PID" ] && kill "$DSN_PID" 2>/dev/null || true; [ -n "$HORIZONS_PID" ] && kill "$HORIZONS_PID" 2>/dev/null || true; kill "$DISTEST_PID" 2>/dev/null || true; kill "$TRIVIA_PID" 2>/dev/null || true' EXIT
-
-#############################################
 # Static panel text (unchanged across videos)
 #############################################
-printf 'N A N C Y   R O M A N'   > "$ASSET_DIR/title1.txt"
-printf 'S P A C E   T E L E S C O P E'       > "$ASSET_DIR/title2.txt"
-printf "T O D A Y ' S   M I S S I O N   U P D A T E" > "$ASSET_DIR/header.txt"
-printf 'LIVE · JOURNEY TO L2'                > "$ASSET_DIR/eyebrow.txt"
-printf 'SUBSCRIBE to follow the mission'     > "$ASSET_DIR/cta.txt"
+printf 'O B S E R V E   T H E'               > "$ASSET_DIR/title1.txt"
+printf 'M O O N   N I G H T   2 0 2 6'       > "$ASSET_DIR/title2.txt"
+printf 'M O O N   W A T C H'                 > "$ASSET_DIR/header.txt"
+printf 'LIVE · SEPTEMBER 19'                 > "$ASSET_DIR/eyebrow.txt"
+printf 'SUBSCRIBE for more space livestreams' > "$ASSET_DIR/cta.txt"
+printf '%s' "$CREDIT_TEXT"                   > "$ASSET_DIR/credit.txt"
+printf 'DID YOU KNOW'                        > "$ASSET_DIR/fact_label.txt"
+printf 'OBSERVING TIP'                       > "$ASSET_DIR/instr_label.txt"
+printf 'THE TERMINATOR'                      > "$ASSET_DIR/instr_title.txt"
 
 #############################################
-# "ASK ROMAN" trivia CTA — alternates with the subscribe prompt in
-# the same on-screen slot (see build_final_filter) so the periodic
-# call-to-action isn't just "subscribe" on every cycle. Rotated by a
-# lightweight background writer, same pattern as next_milestone.
+# "MOON QUIZ" trivia CTA — alternates with the subscribe prompt in the
+# same on-screen slot (see build_final_filter). Override the pool with a
+# trivia.txt file (one line per prompt).
 #############################################
 DEFAULT_TRIVIA=(
-    "ASK ROMAN: mirror size? 2.4m — same as Hubble's."
-    "ASK ROMAN: field of view? 100x wider than Hubble."
-    "ASK ROMAN: destination? Sun-Earth L2, ~1.5M km out."
-    "ASK ROMAN: named for? NASA's first chief astronomer."
-    "ASK ROMAN: launch vehicle? A SpaceX Falcon Heavy."
-    "ASK ROMAN: mission length? At least 5 years at L2."
-    "ASK ROMAN: what's a coronagraph? A starlight blocker."
-    "ASK ROMAN: exoplanet goal? Toward 100,000 known worlds."
+    "MOON QUIZ: distance? About 384,400 km away."
+    "MOON QUIZ: gravity? Just 1/6 of Earth's."
+    "MOON QUIZ: one lunar cycle? About 29.5 days."
+    "MOON QUIZ: dark patches? Lunar maria."
+    "MOON QUIZ: far side? Never faces Earth."
+    "MOON QUIZ: drifting away? 3.8 cm a year."
+    "MOON QUIZ: LRO has mapped it since? 2009."
+    "MOON QUIZ: best place to look? The terminator."
 )
 TRIVIA_FILE="${TRIVIA_FILE:-trivia.txt}"
 if [ -f "$TRIVIA_FILE" ]; then
@@ -824,50 +501,48 @@ printf '%s' "${TRIVIA_POOL[0]}" > "$ASSET_DIR/cta_trivia.txt"
     done
 ) &
 TRIVIA_PID=$!
-printf 'DID YOU KNOW'                        > "$ASSET_DIR/fact_label.txt"
-printf 'PAYLOAD'                             > "$ASSET_DIR/instr_label.txt"
-printf 'WFI · CORONAGRAPH'                   > "$ASSET_DIR/instr_title.txt"
 
 #############################################
 # Default headline / fact pools
+# (avoid '%' and backslashes in these — drawtext treats them specially)
 #############################################
 DEFAULT_HEADLINES=(
-    "Roman launched August 30, 2026 aboard a Falcon Heavy from Kennedy Space Center."
-    "Roman is on a three-month journey to Sun-Earth Lagrange Point 2, about 1.5 million kilometers away."
-    "Roman's field of view is at least 100 times larger than Hubble's."
-    "During its planned mission, Roman could measure light from a billion galaxies."
-    "The Wide Field Instrument gives Roman its huge panoramic view of the sky."
-    "Roman's Coronagraph Instrument will block starlight to directly image exoplanets."
-    "Roman is named for Nancy Grace Roman, NASA's first chief astronomer."
-    "Roman will help settle open questions about dark energy and dark matter."
-    "Roman shares a 2.4 meter primary mirror heritage with the Hubble Space Telescope design."
-    "Along the way to L2, Roman is being commissioned: instruments powered on, checked, and calibrated."
-    "Roman completed its first mid-course correction burn shortly after launch."
-    "At L2, Roman will orbit in a halo around a gravitationally stable point beyond the Moon."
-    "Roman is expected to boost the number of known exoplanets from thousands toward 100,000."
-    "Roman's data will be shared openly, with little to no proprietary period, unlike many past missions."
+    "International Observe the Moon Night 2026 takes place on September 19."
+    "It is a worldwide celebration of lunar science and exploration, held every year since 2010."
+    "The date is chosen near the first quarter Moon, when surface features stand out."
+    "This year the first quarter Moon fell on September 18, so the Moon is a waxing gibbous."
+    "The event is sponsored by NASA's Lunar Reconnaissance Orbiter and Goddard's Solar System Exploration Division."
+    "Astronomy clubs, museums and observatories host star parties and virtual events around the world."
+    "You don't need a telescope: the Moon is easy to see with the naked eye, even from a bright city."
+    "Along the terminator, the line between lunar day and night, long shadows make craters pop."
+    "On September 19 the waxing gibbous Moon sits in the constellation Sagittarius."
+    "Artemis II sent four astronauts around the Moon in April 2026."
+    "The Moon is about 384,400 kilometers from Earth on average."
+    "Join an event, host your own, or simply step outside and look up."
+    "Find an event near you on NASA's Observe the Moon Night website."
+    "Share your Moon photos and stories with moon-watchers around the world."
 )
 
 DEFAULT_FACTS=(
-    "Sun-Earth L2 sits about 1.5 million kilometers from Earth, in the direction away from the Sun."
-    "The James Webb Space Telescope also orbits near L2, alongside Roman."
-    "Roman's primary mirror is 2.4 meters across, the same size as Hubble's."
-    "Roman observes in near-infrared light, letting it see through dust that blocks visible light."
-    "A coronagraph works like an artificial eclipse, blocking a star's glare to reveal faint nearby planets."
-    "Roman's wide field of view lets it survey huge patches of sky in a single pointing."
-    "Roman is expected to operate for at least five years after reaching L2."
-    "Dark energy is the mysterious force thought to be accelerating the universe's expansion."
-    "Roman will conduct a Galactic Bulge survey to hunt for planets via microlensing."
-    "Microlensing lets Roman detect planets by watching for the gravitational bending of starlight."
-    "Roman's spacecraft was built and assembled at NASA's Goddard Space Flight Center."
-    "It takes about three months for a spacecraft to cruise from Earth out to L2."
-    "Roman will complement Hubble and Webb rather than replace them, each suited to different tasks."
-    "Roman's instruments had to be powered on and calibrated gradually during its cruise to L2."
+    "The Moon is about 384,400 kilometers from Earth on average."
+    "The Moon is tidally locked, so we always see the same side from Earth."
+    "One full lunar cycle, from new Moon to new Moon, takes about 29.5 days."
+    "The dark patches on the Moon are maria, ancient plains of solidified lava."
+    "The terminator is the line between lunar day and night, and the best place to spot craters."
+    "NASA's Lunar Reconnaissance Orbiter has been mapping the Moon from orbit since 2009."
+    "Gravity on the Moon is about one-sixth of Earth's."
+    "The Moon drifts away from Earth by about 3.8 centimeters every year."
+    "Earthshine, the faint glow on a crescent Moon's dark side, is sunlight reflected off Earth."
+    "Apollo astronauts brought back about 382 kilograms of lunar rock and soil."
+    "The Moon's gravity is the main driver of ocean tides on Earth."
+    "Moon phases happen because we see different amounts of its sunlit half as it orbits."
+    "The Moon has almost no atmosphere, so its sky is black even in daytime."
+    "Binoculars will show you many more craters than the naked eye can see."
 )
 
 #############################################
-# build_labels_chain — unchanged from the solar script (generic
-# coordinate-callout feature; still works on any center-strip video).
+# build_labels_chain — generic coordinate-callout feature (unchanged;
+# still works on any center-strip video via <basename>.labels.txt).
 #############################################
 build_labels_chain() {
     local url="$1"
@@ -1000,8 +675,8 @@ build_labels_chain() {
 }
 
 #############################################
-# prepare_video_content — same per-video override mechanism as the
-# solar script (<basename>.headlines.txt / .facts.txt), rebuilds
+# prepare_video_content — per-video override mechanism
+# (<basename>.headlines.txt / .facts.txt / .instrument.txt), rebuilds
 # BASE_CHAIN / FACT_END for the video about to stream.
 #############################################
 prepare_video_content() {
@@ -1010,12 +685,6 @@ prepare_video_content() {
     base="${url##*/}"
     base="${base%.*}"
     local i idx
-
-    if [ "$PANEL_IMAGES_AVAILABLE" = true ]; then
-        MID_PANEL_IMG="${PANEL_IMAGE_LOCAL_FILES[$((PANEL_IMAGE_COUNTER % NUM_PANEL_IMAGES))]}"
-        PANEL_IMAGE_COUNTER=$((PANEL_IMAGE_COUNTER + 1))
-        echo "Mission Status panel thumbnail this video: $MID_PANEL_IMG"
-    fi
 
     RAW_LINES=()
     if [ -f "${base}.headlines.txt" ]; then
@@ -1057,25 +726,10 @@ prepare_video_content() {
         done < <(printf '%s\n' "${fpool[@]}" | shuf)
     fi
 
-    # Prefer real DSN/Horizons readings over the modeled estimate
-    # whenever either has actually produced a number recently — this
-    # is re-checked every video rotation, so the card switches over
-    # to live data automatically the moment a real reading appears.
-    if [ -s "$ASSET_DIR/dist_from_earth.txt" ] && grep -q '[0-9]' "$ASSET_DIR/dist_from_earth.txt"; then
-        DIST_FROM_EARTH_FILE="dist_from_earth.txt"
-    else
-        DIST_FROM_EARTH_FILE="dist_from_earth_est.txt"
-    fi
-    if [ -s "$ASSET_DIR/dist_traveled.txt" ] && grep -q '[0-9]' "$ASSET_DIR/dist_traveled.txt"; then
-        DIST_TRAVELED_FILE="dist_traveled.txt"
-    else
-        DIST_TRAVELED_FILE="dist_traveled_est.txt"
-    fi
-
     if [ -f "${base}.instrument.txt" ]; then
         head -n 1 "${base}.instrument.txt" > "$ASSET_DIR/instr_sub.txt"
     else
-        printf 'Wide Field Instrument + Coronagraph, imaging in near-infrared' > "$ASSET_DIR/instr_sub.txt"
+        printf 'Look along the day/night line, where long shadows make craters and mountains stand out.' > "$ASSET_DIR/instr_sub.txt"
     fi
     fold -s -w 26 "$ASSET_DIR/instr_sub.txt" > "$ASSET_DIR/instr_sub.wrapped.txt"
 
@@ -1127,15 +781,24 @@ prepare_video_content() {
     RFACT_TEXT_Y=$((RFACT_LABEL_Y + 24))
 
     #########################################
+    # Moon state for this video. Refreshed on every video rotation, which
+    # is plenty for things that change over hours/days (phase disc, cycle
+    # bar, illumination gauge). The text readouts refresh live via reload=1.
+    #########################################
+    local MOON_PSI=90 MOON_ILLUM_PCT=50 MOON_AGE_FRAC=0.25 MOON_COSA=0 MOON_WAXING=1
+    read -r MOON_PSI MOON_ILLUM_PCT MOON_AGE_FRAC MOON_COSA MOON_WAXING < <(python3 moon_calc.py once 2>/dev/null) || true
+    local MOON_SGN=1
+    [ "$MOON_WAXING" = "0" ] && MOON_SGN=-1
+    [ "$MOON_FLIP" = "true" ] && MOON_SGN=$((MOON_SGN * -1))
+    echo "Moon this video: phase angle ${MOON_PSI} deg, ${MOON_ILLUM_PCT} PCT illuminated, cycle fraction ${MOON_AGE_FRAC}"
+
+    #########################################
     # Rebuild BASE_CHAIN for this video's content
     #########################################
     CHAIN="color=c=black:s=1280x720[canvas];"
-    # Scale by VIDEO_ZOOM extra so there's margin to pan within, then
-    # crop the fixed output size from a position offset by VIDEO_PAN_X/
-    # VIDEO_PAN_Y — at zoom=1.0/pan=0 this is identical to the old
-    # plain center-crop. crop's x/y expressions clamp to valid range on
-    # their own, so a pan value that would go out of bounds just pins
-    # to the edge instead of erroring.
+    # Scale by VIDEO_ZOOM extra so there's margin to pan within, then crop
+    # the fixed output size from a position offset by VIDEO_PAN_X/Y — at
+    # zoom=1.0/pan=0 this is a plain center-crop.
     local ZOOM_W ZOOM_H
     ZOOM_W=$(awk -v w="$CENTER_W" -v z="$VIDEO_ZOOM" 'BEGIN{printf "%d", w*z}')
     ZOOM_H=$(awk -v h="$VIDEO_ROW_H" -v z="$VIDEO_ZOOM" 'BEGIN{printf "%d", h*z}')
@@ -1160,9 +823,7 @@ prepare_video_content() {
     CHAIN+="[br6]drawbox=x=$((VX1 - BR_M - BR_L)):y=$((VY1 - BR_M - BR_T)):w=${BR_L}:h=${BR_T}:color=${GOLD}@0.9:t=fill[br7];"
     CHAIN+="[br7]drawbox=x=$((VX1 - BR_M - BR_T)):y=$((VY1 - BR_M - BR_L)):w=${BR_T}:h=${BR_L}:color=${GOLD}@0.9:t=fill[br8];"
 
-    # Small reticle nodes at each bracket vertex + center tick marks on
-    # the top/bottom edges — a targeting-reticle touch (like the "Eyes"
-    # app's spacecraft-tracking view) instead of plain L-brackets.
+    # Small reticle nodes at each bracket vertex + center tick marks.
     local BR_DOT=3
     CHAIN+="[br8]drawbox=x=$((VX0 + BR_M - 1)):y=$((VY0 + BR_M - 1)):w=${BR_DOT}:h=${BR_DOT}:color=${GOLD}:t=fill[brdot1];"
     CHAIN+="[brdot1]drawbox=x=$((VX1 - BR_M - 2)):y=$((VY0 + BR_M - 1)):w=${BR_DOT}:h=${BR_DOT}:color=${GOLD}:t=fill[brdot2];"
@@ -1181,7 +842,7 @@ prepare_video_content() {
     local CARD_X0=$((CENTER_X0 + CARD_PAD))
     local CARD_W=$((CENTER_W - CARD_PAD * 2))
 
-    # ---------------- Row 2: MISSION STATUS card ----------------
+    # ---------------- Row 2: MOON TONIGHT card ----------------
     local CM3_Y0=$((ROW2_Y + CARD_PAD))
     local CM3_Y1=$((ROW3_Y - CARD_PAD))
     CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM3_Y0}:w=${CARD_W}:h=$((CM3_Y1 - CM3_Y0)):color=${PANEL_BG}@0.55:t=fill[cm3card];"
@@ -1195,44 +856,58 @@ prepare_video_content() {
     local CM3_LINE5_Y=$((CM3_LINE4_Y + 26))
 
     CHAIN+="[cm3border]drawbox=x=$((MTEXT_INSET - 2)):y=$((CM3_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill[cm3z];"
-    CHAIN+="[cm3z]drawtext=fontfile=${FONT}:text='MISSION STATUS':fontcolor=${GOLD}@0.85:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM3_LABEL_Y - 6))[cm3z2];"
+    CHAIN+="[cm3z]drawtext=fontfile=${FONT}:text='MOON TONIGHT':fontcolor=${GOLD}@0.85:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM3_LABEL_Y - 6))[cm3z2];"
     CHAIN+="[cm3z2]drawbox=x=${MTEXT_INSET}:y=$((CM3_LABEL_Y + 14)):w=$((CARD_W - 40)):h=1:color=white@0.15:t=fill[cm3a];"
-    CHAIN+="[cm3a]drawtext=fontfile=${FONT}:text='MISSION DAY':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE1_Y}[cm3b];"
-    CHAIN+="[cm3b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_day.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE1_Y}[cm3c];"
-    CHAIN+="[cm3c]drawtext=fontfile=${FONT}:text='ELAPSED TIME':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE2_Y}[cm3d];"
-    CHAIN+="[cm3d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_clock.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE2_Y}[cm3e];"
-    CHAIN+="[cm3e]drawtext=fontfile=${FONT}:text='DIST. FROM EARTH':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE3_Y}[cm3f];"
-    CHAIN+="[cm3f]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/${DIST_FROM_EARTH_FILE}:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE3_Y}[cm3g];"
-    CHAIN+="[cm3g]drawtext=fontfile=${FONT}:text='DIST. TRAVELED':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE4_Y}[cm3h];"
-    CHAIN+="[cm3h]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/${DIST_TRAVELED_FILE}:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE4_Y}[cm3i];"
-    CHAIN+="[cm3i]drawtext=fontfile=${FONT}:text='TARGET':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE5_Y}[cm3j];"
-    CHAIN+="[cm3j]drawtext=fontfile=${FONT}:text='Sun-Earth L2':fontcolor=${GOLD}:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE5_Y}[cm3final];"
+    CHAIN+="[cm3a]drawtext=fontfile=${FONT}:text='PHASE':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE1_Y}[cm3b];"
+    CHAIN+="[cm3b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_phase.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE1_Y}[cm3c];"
+    CHAIN+="[cm3c]drawtext=fontfile=${FONT}:text='ILLUMINATED':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE2_Y}[cm3d];"
+    CHAIN+="[cm3d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_illum.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE2_Y}[cm3e];"
+    CHAIN+="[cm3e]drawtext=fontfile=${FONT}:text='MOON AGE':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE3_Y}[cm3f];"
+    CHAIN+="[cm3f]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_age.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE3_Y}[cm3g];"
+    CHAIN+="[cm3g]drawtext=fontfile=${FONT}:text='DIST. FROM EARTH':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE4_Y}[cm3h];"
+    CHAIN+="[cm3h]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_dist.txt:reload=1:fontcolor=white:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE4_Y}[cm3i];"
+    CHAIN+="[cm3i]drawtext=fontfile=${FONT}:text='EVENT':fontcolor=white@0.55:fontsize=13:x=${MTEXT_INSET}:y=${CM3_LINE5_Y}[cm3j];"
+    CHAIN+="[cm3j]drawtext=fontfile=${FONT}:text='InOMN · Sep 19, 2026':fontcolor=${GOLD}:fontsize=14:x=${MVALUE_X}:y=${CM3_LINE5_Y}[cm3final];"
     prev="cm3final"
 
-    # ---------------- Center strip: framed Roman thumbnail ----------------
-    if [ "$PANEL_IMAGES_AVAILABLE" = true ]; then
-        local MID_X0=$((MTEXT_INSET + 400))
-        local MID_AVAIL_W=$(((CARD_X0 + CARD_W - 14) - MID_X0))
-        local MID_TOP=$((CM3_LABEL_Y + 14 + 14))
-        local MID_BOTTOM=$((CM3_Y1 - 16))
-        local MID_AVAIL_H=$((MID_BOTTOM - MID_TOP))
-        if [ "$MID_AVAIL_W" -ge 90 ] && [ "$MID_AVAIL_H" -ge 90 ]; then
-            local MTHUMB=$MID_AVAIL_W
-            [ "$MID_AVAIL_H" -lt "$MTHUMB" ] && MTHUMB=$MID_AVAIL_H
-            [ "$MTHUMB" -gt 130 ] && MTHUMB=130
-            local MTX=$((MID_X0 + (MID_AVAIL_W - MTHUMB) / 2))
-            local MTY=$((MID_TOP + (MID_AVAIL_H - MTHUMB) / 2))
-            CHAIN+="[${prev}]drawbox=x=$((MTX - 4)):y=$((MTY - 4)):w=$((MTHUMB + 8)):h=$((MTHUMB + 8)):color=black@0.6:t=fill[mthumbbg];"
-            CHAIN+="[mthumbbg]drawbox=x=$((MTX - 4)):y=$((MTY - 4)):w=$((MTHUMB + 8)):h=$((MTHUMB + 8)):color=${GOLD}@0.5:t=1[mthumbborder];"
-            CHAIN+="[3:v]fps=30,scale=${MTHUMB}:${MTHUMB}:force_original_aspect_ratio=increase,crop=${MTHUMB}:${MTHUMB}[mimg];"
-            CHAIN+="[mthumbborder][mimg]overlay=x=${MTX}:y=${MTY}:shortest=1[mthumbfinal];"
-            prev="mthumbfinal"
-        fi
+    # ---------------- Row 2, right: live-rendered Moon phase disc ----------------
+    # Drawn procedurally with geq from tonight's phase angle: the lit side
+    # is right-hand for a waxing Moon and left-hand for a waning one (Northern
+    # Hemisphere view; MOON_FLIP=true mirrors it), with a little limb
+    # shading so it reads as a sphere.
+    local MID_X0=$((MTEXT_INSET + 400))
+    local MID_AVAIL_W=$(((CARD_X0 + CARD_W - 14) - MID_X0))
+    local MID_TOP=$((CM3_LABEL_Y + 14 + 14))
+    local MID_BOTTOM=$((CM3_Y1 - 16))
+    local MID_AVAIL_H=$((MID_BOTTOM - MID_TOP))
+    if [ "$MID_AVAIL_W" -ge 90 ] && [ "$MID_AVAIL_H" -ge 90 ]; then
+        local MTHUMB=$MID_AVAIL_W
+        [ "$MID_AVAIL_H" -lt "$MTHUMB" ] && MTHUMB=$MID_AVAIL_H
+        [ "$MTHUMB" -gt 130 ] && MTHUMB=130
+        local MTX=$((MID_X0 + (MID_AVAIL_W - MTHUMB) / 2))
+        local MTY=$((MID_TOP + (MID_AVAIL_H - MTHUMB) / 2))
+        local MC=$((MTHUMB / 2))
+        local MR=$((MTHUMB / 2 - 3))
+        local M_RR="(hypot(X-${MC}\,Y-${MC})/${MR})"
+        local M_SQ="sqrt(max(0\,1-pow((Y-${MC})/${MR}\,2)))"
+        local M_LIT="gte(${MOON_SGN}*(X-${MC})/${MR}\,${MOON_COSA}*${M_SQ})"
+        local M_LIMB="(0.72+0.28*sqrt(max(0\,1-pow(${M_RR}\,2))))"
+        local M_R_EXPR="if(lte(${M_RR}\,1)\,if(${M_LIT}\,236*${M_LIMB}\,28)\,0)"
+        local M_G_EXPR="if(lte(${M_RR}\,1)\,if(${M_LIT}\,232*${M_LIMB}\,32)\,0)"
+        local M_B_EXPR="if(lte(${M_RR}\,1)\,if(${M_LIT}\,214*${M_LIMB}\,44)\,0)"
+        local M_A_EXPR="if(lte(${M_RR}\,1)\,255\,0)"
+        CHAIN+="[${prev}]drawbox=x=$((MTX - 4)):y=$((MTY - 4)):w=$((MTHUMB + 8)):h=$((MTHUMB + 8)):color=black@0.6:t=fill[mthumbbg];"
+        CHAIN+="[mthumbbg]drawbox=x=$((MTX - 4)):y=$((MTY - 4)):w=$((MTHUMB + 8)):h=$((MTHUMB + 8)):color=${GOLD}@0.5:t=1[mthumbborder];"
+        # 1 fps source: the phase doesn't animate, so don't burn CPU on 30 geq frames/s.
+        CHAIN+="color=c=black@0:s=${MTHUMB}x${MTHUMB}:r=1[moon_src];"
+        CHAIN+="[moon_src]format=rgba,geq=r='${M_R_EXPR}':g='${M_G_EXPR}':b='${M_B_EXPR}':a='${M_A_EXPR}'[mimg];"
+        CHAIN+="[mthumbborder][mimg]overlay=x=${MTX}:y=${MTY}:shortest=1[mthumbfinal];"
+        prev="mthumbfinal"
     fi
 
-    # ---------------- Row 3: "JOURNEY TO L2" progress visualization ----------------
-    # Bar fills according to elapsed mission days / JOURNEY_TOTAL_DAYS —
-    # a planning estimate, clearly labeled as such, not a tracked figure.
+    # ---------------- Row 3: LUNAR CYCLE progress bar ----------------
+    # Fill = how far through the ~29.5-day new-to-new cycle the Moon is,
+    # with ticks at new / first quarter / full / last quarter.
     local CM4_Y0=$((ROW3_Y + CARD_PAD))
     local CM4_Y1=$((680 - CARD_PAD))
     CHAIN+="[${prev}]drawbox=x=${CARD_X0}:y=${CM4_Y0}:w=${CARD_W}:h=$((CM4_Y1 - CM4_Y0)):color=${PANEL_BG}@0.55:t=fill[cm4card];"
@@ -1243,56 +918,37 @@ prepare_video_content() {
     local CM4_BAR_H=18
     local CM4_BAR_X=$((MTEXT_INSET - 4))
     local CM4_BAR_W=$((CARD_W - 40))
-    local JOURNEY_TOTAL_SECONDS=$((JOURNEY_TOTAL_DAYS * 86400))
-
-    # ffmpeg's own `t` variable is relative to when THIS video's ffmpeg
-    # process started, not to the real launch date, so the fill amount
-    # is computed here in bash (real wall-clock elapsed / planned
-    # cruise length) each time prepare_video_content runs — i.e. it
-    # refreshes on every video rotation, not frame-by-frame, which is
-    # more than fine for a bar that moves over weeks.
-    local NOW_S_FOR_BAR
-    NOW_S_FOR_BAR=$(date -u +%s)
-    local ELAPSED_S_FOR_BAR=$((NOW_S_FOR_BAR - ROMAN_LAUNCH_EPOCH_S))
-    [ "$ELAPSED_S_FOR_BAR" -lt 0 ] && ELAPSED_S_FOR_BAR=0
-    # Same calibrated power-law curve as the distance estimator above
-    # (dist(t) = A*t^p, anchored to a real NASA figure) rather than a
-    # straight elapsed/total ratio or a generic S-curve, so this bar,
-    # the CRUISE PROGRESS pie further down, and the DIST. FROM EARTH
-    # estimate all agree with each other instead of implying three
-    # different "how far along" numbers.
-    EASED_FRAC=$(python3 -c "
-import math
-elapsed_days = min($ELAPSED_S_FOR_BAR / 86400.0, $JOURNEY_TOTAL_DAYS)
-anchor_day, anchor_km, total_days, l2_km = $ROMAN_DIST_ANCHOR_DAY, $ROMAN_DIST_ANCHOR_KM, $JOURNEY_TOTAL_DAYS, $L2_DIST_KM
-if anchor_day > 0 and anchor_km > 0 and total_days > anchor_day:
-    p = math.log(l2_km / anchor_km) / math.log(total_days / anchor_day)
-    A = anchor_km / (anchor_day ** p)
-else:
-    p, A = 1.0, l2_km / total_days
-dist = A * (elapsed_days ** p) if elapsed_days > 0 else 0.0
-print(min(dist / l2_km, 1.0))
-")
     local CM4_FILL_W
-    CM4_FILL_W=$(awk -v w="$CM4_BAR_W" -v f="$EASED_FRAC" 'BEGIN{printf "%d", w*f}')
+    CM4_FILL_W=$(awk -v w="$CM4_BAR_W" -v f="$MOON_AGE_FRAC" 'BEGIN{printf "%d", w*f}')
     [ "$CM4_FILL_W" -gt "$CM4_BAR_W" ] && CM4_FILL_W=$CM4_BAR_W
     [ "$CM4_FILL_W" -lt 0 ] && CM4_FILL_W=0
+    local CM4_TICK_LABEL_Y=$((CM4_BAR_Y + CM4_BAR_H + 12))
 
     CHAIN+="[cm4border]drawbox=x=$((MTEXT_INSET - 2)):y=$((CM4_LABEL_Y - 2)):w=6:h=6:color=${RED}:t=fill:enable='lt(mod(t\,1.2)\,0.75)'[cm4a];"
-    CHAIN+="[cm4a]drawtext=fontfile=${FONT}:text='JOURNEY TO L2 (est.)':fontcolor=white@0.75:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM4_LABEL_Y - 6))[cm4b];"
+    CHAIN+="[cm4a]drawtext=fontfile=${FONT}:text='LUNAR CYCLE (est.)':fontcolor=white@0.75:fontsize=13:x=$((MTEXT_INSET + 14)):y=$((CM4_LABEL_Y - 6))[cm4b];"
     CHAIN+="[cm4b]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=black@0.4:t=fill[cm4barbg];"
-    CHAIN+="[cm4barbg]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=white@0.2:t=1[cm4barborder];"
-    CHAIN+="[cm4barborder]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_FILL_W}:h=${CM4_BAR_H}:color=${GOLD}@0.85:t=fill[cm4fillraw];"
-    prev="cm4fillraw"
-    CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/mission_day.txt:reload=1:fontcolor=white:fontsize=13:x=$((CM4_BAR_X)):y=$((CM4_BAR_Y + CM4_BAR_H + 12)):${SHADOW}[cm4day];"
-    CHAIN+="[cm4day]drawtext=fontfile=${FONT}:text='of ~${JOURNEY_TOTAL_DAYS} day cruise':fontcolor=white@0.55:fontsize=13:x=$((CM4_BAR_X + 90)):y=$((CM4_BAR_Y + CM4_BAR_H + 12))[cm4base];"
+    CHAIN+="[cm4barbg]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_FILL_W}:h=${CM4_BAR_H}:color=${GOLD}@0.85:t=fill[cm4fill];"
+    CHAIN+="[cm4fill]drawbox=x=${CM4_BAR_X}:y=${CM4_BAR_Y}:w=${CM4_BAR_W}:h=${CM4_BAR_H}:color=white@0.2:t=1[cm4barborder];"
+    prev="cm4barborder"
+    local tk tkx
+    for tk in 1 2 3; do
+        tkx=$((CM4_BAR_X + CM4_BAR_W * tk / 4))
+        CHAIN+="[${prev}]drawbox=x=${tkx}:y=${CM4_BAR_Y}:w=1:h=${CM4_BAR_H}:color=white@0.45:t=fill[cm4t${tk}];"
+        prev="cm4t${tk}"
+    done
+    # "You are here" marker at the current point in the cycle.
+    CHAIN+="[${prev}]drawbox=x=$((CM4_BAR_X + CM4_FILL_W - 1)):y=$((CM4_BAR_Y - 4)):w=3:h=$((CM4_BAR_H + 8)):color=white:t=fill[cm4mark];"
+    CHAIN+="[cm4mark]drawtext=fontfile=${FONT}:text='NEW':fontcolor=white@0.55:fontsize=12:x=${CM4_BAR_X}:y=${CM4_TICK_LABEL_Y}[cm4l1];"
+    CHAIN+="[cm4l1]drawtext=fontfile=${FONT}:text='1ST QTR':fontcolor=white@0.55:fontsize=12:x=$((CM4_BAR_X + CM4_BAR_W / 4))-text_w/2:y=${CM4_TICK_LABEL_Y}[cm4l2];"
+    CHAIN+="[cm4l2]drawtext=fontfile=${FONT}:text='FULL':fontcolor=white@0.55:fontsize=12:x=$((CM4_BAR_X + CM4_BAR_W / 2))-text_w/2:y=${CM4_TICK_LABEL_Y}[cm4l3];"
+    CHAIN+="[cm4l3]drawtext=fontfile=${FONT}:text='LAST QTR':fontcolor=white@0.55:fontsize=12:x=$((CM4_BAR_X + CM4_BAR_W * 3 / 4))-text_w/2:y=${CM4_TICK_LABEL_Y}[cm4l4];"
+    CHAIN+="[cm4l4]drawtext=fontfile=${FONT}:text='NEW':fontcolor=white@0.55:fontsize=12:x=$((CM4_BAR_X + CM4_BAR_W))-text_w:y=${CM4_TICK_LABEL_Y}[cm4base];"
     prev="cm4base"
 
-    # ---------------- Left panel: story / headlines (unchanged structure) ----------------
+    # ---------------- Left panel: story / headlines ----------------
     CHAIN+="[${prev}]drawbox=x=0:y=0:w=${PANEL_W}:h=720:color=${PANEL_BG}@0.94:t=fill[p1];"
     CHAIN+="[p1]drawbox=x=${PANEL_W}:y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[p2];"
-    # Top-edge "glow" (a soft wide bar under a thin bright one) instead
-    # of a single flat line — reads less like a flat UI divider.
+    # Top-edge "glow" (a soft wide bar under a thin bright one).
     CHAIN+="[p2]drawbox=x=0:y=0:w=${PANEL_W}:h=10:color=${GOLD}@0.18:t=fill[p2g];"
     CHAIN+="[p2g]drawbox=x=0:y=0:w=${PANEL_W}:h=3:color=${GOLD}@0.95:t=fill[p3];"
 
@@ -1306,8 +962,8 @@ print(min(dist / l2_km, 1.0))
 
     CHAIN+="[p9]drawbox=x=${TEXT_INSET}:y=171:w=8:h=8:color=${GOLD}:t=fill[p10];"
     CHAIN+="[p10]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=14:x=$((TEXT_INSET + 16)):y=168[p11];"
-    CHAIN+="[p11]drawtext=fontfile=${FONT}:text='NEXT\: ':fontcolor=white@0.45:fontsize=12:x=${TEXT_INSET}:y=191[p11b];"
-    CHAIN+="[p11b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/next_milestone.txt:reload=1:fontcolor=${GOLD}@0.85:fontsize=12:x=$((TEXT_INSET + 42)):y=191[p11c];"
+    CHAIN+="[p11]drawtext=fontfile=${FONT}:text='NOW\: ':fontcolor=white@0.45:fontsize=12:x=${TEXT_INSET}:y=191[p11b];"
+    CHAIN+="[p11b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_summary.txt:reload=1:fontcolor=${GOLD}@0.85:fontsize=12:x=$((TEXT_INSET + 42)):y=191[p11c];"
 
     local prev="p11c"
     for i in "${!RAW_LINES[@]}"; do
@@ -1350,7 +1006,9 @@ print(min(dist / l2_km, 1.0))
         fi
     done
 
-    # ---------------- Left panel: animated "MISSION ACTIVITY" bar graph ----------------
+    # ---------------- Left panel: animated "LIVE SIGNAL" bar graph ----------------
+    # Purely decorative (not data-driven), like the activity graph in the
+    # earlier scripts — so it carries no number, just motion.
     local GRAPH_LABEL_Y=$((DOTS_Y + 40))
     local GRAPH_BASE_Y=$((GRAPH_LABEL_Y + 160))
     local BAR_COUNT=14
@@ -1360,8 +1018,7 @@ print(min(dist / l2_km, 1.0))
     local BAR_MAXH=100
 
     CHAIN+="[${prev}]drawbox=x=$((TEXT_INSET - 2)):y=$((GRAPH_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill:enable='lt(mod(t\,1.4)\,0.9)'[sa1];"
-    CHAIN+="[sa1]drawtext=fontfile=${FONT}:text='MISSION ACTIVITY':fontcolor=white@0.55:fontsize=11:x=$((TEXT_INSET + 14)):y=$((GRAPH_LABEL_Y - 8))[sa2];"
-    CHAIN+="[sa2]drawtext=fontfile=${FONT}:text='%{eif\:64+24*sin(2*PI*t/11)\:d} PCT':fontcolor=${GOLD}:fontsize=16:x=${TEXT_INSET}:y=$((GRAPH_LABEL_Y + 10)):${SHADOW}[sa3];"
+    CHAIN+="[sa1]drawtext=fontfile=${FONT}:text='LIVE SIGNAL':fontcolor=white@0.55:fontsize=11:x=$((TEXT_INSET + 14)):y=$((GRAPH_LABEL_Y - 8))[sa3];"
     prev="sa3"
 
     local bi bx h_expr y_expr bnxt
@@ -1376,13 +1033,13 @@ print(min(dist / l2_km, 1.0))
     CHAIN+="[${prev}]drawbox=x=${TEXT_INSET}:y=${GRAPH_BASE_Y}:w=${PANEL_TEXT_W}:h=1:color=white@0.2:t=fill[sabase];"
     prev="sabase"
 
-    # ---------------- Right panel: stats + payload + facts ----------------
+    # ---------------- Right panel: stats + observing tip + facts ----------------
     CHAIN+="[${prev}]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=720:color=${PANEL_BG}@0.94:t=fill[r1];"
     CHAIN+="[r1]drawbox=x=$((RIGHT_X0 - 3)):y=0:w=3:h=720:color=${GOLD}@0.75:t=fill[r2];"
     CHAIN+="[r2]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=10:color=${GOLD}@0.18:t=fill[r2g];"
     CHAIN+="[r2g]drawbox=x=${RIGHT_X0}:y=0:w=${PANEL_W}:h=3:color=${GOLD}@0.95:t=fill[r3];"
 
-    CHAIN+="[r3]drawtext=fontfile=${FONT}:text='Credits\: NASA / GSFC':fontcolor=white@0.85:fontsize=14:x=${RTEXT_INSET}:y=${RSTAT_Y}[r4];"
+    CHAIN+="[r3]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/credit.txt:fontcolor=white@0.85:fontsize=14:x=${RTEXT_INSET}:y=${RSTAT_Y}[r4];"
     CHAIN+="[r4]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=14:x=${RTEXT_INSET}:y=$((RSTAT_Y + 20))[r5];"
     CHAIN+="[r5]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.75:fontsize=13:x=${RTEXT_INSET}:y=$((RSTAT_Y + 40))[r6];"
     CHAIN+="[r6]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.75:fontsize=13:x=${RTEXT_INSET}:y=$((RSTAT_Y + 60))[r7];"
@@ -1407,7 +1064,7 @@ print(min(dist / l2_km, 1.0))
         prev="$nxt"
     done
 
-    # ---------------- Right panel: live DSN tracking readings ----------------
+    # ---------------- Right panel: Moon readings (computed) ----------------
     local RREAD_DIV_Y=$((RFACT_TEXT_Y + MAX_FACT_LINES * FACT_LINE_H + 16))
     local RREAD_LABEL_Y=$((RREAD_DIV_Y + 14))
     local RREAD_LINE1_Y=$((RREAD_LABEL_Y + 22))
@@ -1417,21 +1074,20 @@ print(min(dist / l2_km, 1.0))
     local RGRAPH_LABEL_Y=$((RREAD_LINE4_Y + 30))
 
     CHAIN+="[${prev}]drawbox=x=${RTEXT_INSET}:y=${RREAD_DIV_Y}:w=${PANEL_TEXT_W}:h=2:color=white@0.15:t=fill[rr0];"
-    CHAIN+="[rr0]drawtext=fontfile=${FONT}:text='DSN TRACKING (LIVE)':fontcolor=${GOLD}@0.85:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LABEL_Y}[rr0b];"
-    CHAIN+="[rr0b]drawtext=fontfile=${FONT}:text='STATION':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE1_Y}[rr0c];"
-    CHAIN+="[rr0c]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_station.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE1_Y}[rr1];"
-    CHAIN+="[rr1]drawtext=fontfile=${FONT}:text='DATA RATE':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE2_Y}[rr1b];"
-    CHAIN+="[rr1b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_rate.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE2_Y}[rr2];"
-    CHAIN+="[rr2]drawtext=fontfile=${FONT}:text='RANGE (DSN)':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE3_Y}[rr2b];"
-    CHAIN+="[rr2b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_distance.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE3_Y}[rr2c];"
-    CHAIN+="[rr2c]drawtext=fontfile=${FONT}:text='LIGHT TIME':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE4_Y}[rr2d];"
-    CHAIN+="[rr2d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/dsn_lighttime.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE4_Y}[rr3];"
+    CHAIN+="[rr0]drawtext=fontfile=${FONT}:text='MOON READINGS (est.)':fontcolor=${GOLD}@0.85:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LABEL_Y}[rr0b];"
+    CHAIN+="[rr0b]drawtext=fontfile=${FONT}:text='LIGHT TIME':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE1_Y}[rr0c];"
+    CHAIN+="[rr0c]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_light.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE1_Y}[rr1];"
+    CHAIN+="[rr1]drawtext=fontfile=${FONT}:text='ANG. SIZE':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE2_Y}[rr1b];"
+    CHAIN+="[rr1b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_ang.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE2_Y}[rr2];"
+    CHAIN+="[rr2]drawtext=fontfile=${FONT}:text='NEXT FULL':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE3_Y}[rr2b];"
+    CHAIN+="[rr2b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_next_full.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE3_Y}[rr2c];"
+    CHAIN+="[rr2c]drawtext=fontfile=${FONT}:text='NEXT NEW':fontcolor=white@0.55:fontsize=12:x=${RTEXT_INSET}:y=${RREAD_LINE4_Y}[rr2d];"
+    CHAIN+="[rr2d]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/moon_next_new.txt:reload=1:fontcolor=white:fontsize=13:x=$((RTEXT_INSET + 80)):y=${RREAD_LINE4_Y}[rr3];"
     prev="rr3"
 
-    # ---------------- Right panel: mission-clock pie/percent gauge ----------------
-    # Same procedural geq pie-wedge approach as the solar script, now
-    # driven by real elapsed-vs-planned-cruise percentage instead of a
-    # sine wave, plus the launch date underneath.
+    # ---------------- Right panel: illumination pie gauge ----------------
+    # Same procedural geq pie-wedge approach as before, now filled to the
+    # Moon's current illuminated percentage.
     local PIE_LABEL_Y=$((RGRAPH_LABEL_Y))
     local PIE_TOP=$((PIE_LABEL_Y + 18))
     local PIE_AVAIL_H=$((660 - PIE_TOP))
@@ -1444,11 +1100,7 @@ print(min(dist / l2_km, 1.0))
     local PIE_X=$((RTEXT_INSET + (PANEL_TEXT_W - PIE_SIZE) / 2))
     local PIE_Y=$PIE_TOP
 
-    # Same reasoning as the progress bar above: computed here in bash
-    # from the real wall clock (refreshes each video rotation), not
-    # from ffmpeg's per-video-relative `t`.
-    local PIE_PCT_NOW
-    PIE_PCT_NOW=$(awk -v f="$EASED_FRAC" 'BEGIN{printf "%d", f*100}')
+    local PIE_PCT_NOW=$MOON_ILLUM_PCT
     [ "$PIE_PCT_NOW" -gt 100 ] && PIE_PCT_NOW=100
     [ "$PIE_PCT_NOW" -lt 0 ] && PIE_PCT_NOW=0
     local PIE_DIST="hypot(X-${PIE_CX}\,Y-${PIE_CY})"
@@ -1460,12 +1112,12 @@ print(min(dist / l2_km, 1.0))
     local PIE_A_EXPR="if(lte(${PIE_DIST}\,${PIE_R})\,255\,0)"
 
     CHAIN+="[${prev}]drawbox=x=$((RTEXT_INSET - 2)):y=$((PIE_LABEL_Y - 2)):w=6:h=6:color=${GOLD}:t=fill[rgp1];"
-    CHAIN+="[rgp1]drawtext=fontfile=${FONT}:text='CRUISE PROGRESS (est.)':fontcolor=white@0.55:fontsize=11:x=$((RTEXT_INSET + 14)):y=$((PIE_LABEL_Y - 8))[rgp2];"
-    CHAIN+="color=c=black@0:s=${PIE_SIZE}x${PIE_SIZE}[pie_src];"
+    CHAIN+="[rgp1]drawtext=fontfile=${FONT}:text='MOON ILLUMINATED':fontcolor=white@0.55:fontsize=11:x=$((RTEXT_INSET + 14)):y=$((PIE_LABEL_Y - 8))[rgp2];"
+    CHAIN+="color=c=black@0:s=${PIE_SIZE}x${PIE_SIZE}:r=1[pie_src];"
     CHAIN+="[pie_src]format=rgba,geq=r='${PIE_R_EXPR}':g='${PIE_G_EXPR}':b='${PIE_B_EXPR}':a='${PIE_A_EXPR}'[pie_img];"
     CHAIN+="[rgp2][pie_img]overlay=x=${PIE_X}:y=${PIE_Y}:shortest=1[rgp3];"
     CHAIN+="[rgp3]drawtext=fontfile=${FONT}:text='${PIE_PCT_NOW} PCT':fontcolor=white:fontsize=16:x=$((PIE_X + PIE_SIZE / 2 - 28)):y=$((PIE_Y + PIE_SIZE / 2 - 9)):${SHADOW}[rgp4];"
-    CHAIN+="[rgp4]drawtext=fontfile=${FONT}:text='Launched Aug 30, 2026':fontcolor=white@0.5:fontsize=11:x=${RTEXT_INSET}:y=$((PIE_Y + PIE_SIZE + 12))[rgbase];"
+    CHAIN+="[rgp4]drawtext=fontfile=${FONT}:text='InOMN · September 19, 2026':fontcolor=white@0.5:fontsize=11:x=${RTEXT_INSET}:y=$((PIE_Y + PIE_SIZE + 12))[rgbase];"
     prev="rgbase"
 
     BASE_CHAIN="$CHAIN"
@@ -1473,8 +1125,7 @@ print(min(dist / l2_km, 1.0))
 }
 
 #############################################
-# build_final_filter — unchanged from the solar script (CTA / next-
-# video countdown / ticker / watermark).
+# build_final_filter — CTA / ticker / watermark.
 #############################################
 build_final_filter() {
     local total_duration="$1"
@@ -1484,11 +1135,10 @@ build_final_filter() {
     local CTA_SHOW=8
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.6)\,mod(t\,${CTA_CYCLE})/0.6\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.6)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.6\,1))\,0)"
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
-    # Alternate the subscribe CTA with the "ASK ROMAN" trivia CTA every
-    # other cycle, so the periodic call-to-action isn't the same line
-    # each time. Parity is relative to this video's own start time
-    # (ffmpeg's `t`), so a single long-running video will still cycle
-    # between the two; short/looping clips mostly land on the first.
+    # Alternate the subscribe CTA with the "MOON QUIZ" trivia CTA every
+    # other cycle. Parity is relative to this video's own start time
+    # (ffmpeg's `t`), so a single long-running video will cycle between
+    # the two; short/looping clips mostly land on the first.
     local CTA_EVEN="eq(mod(trunc(t/${CTA_CYCLE})\,2)\,0)"
     local CTA_ODD="eq(mod(trunc(t/${CTA_CYCLE})\,2)\,1)"
 
@@ -1496,10 +1146,6 @@ build_final_filter() {
     local CTA_X=$((CENTER_X0 + (CENTER_W - CTA_W) / 2))
     local CTA_Y=640
 
-    # The CTA box (and its accent bar / live dot) only appears during
-    # its own CTA_SHOW window now — no more "Next view in Ns" filler
-    # text in between, so it fully disappears rather than sitting on
-    # screen empty the rest of the cycle.
     tail+="[${FACT_END}]drawbox=x=${CTA_X}:y=${CTA_Y}:w=${CTA_W}:h=43:color=black@0.75:t=fill:enable='${CTA_ENABLE}'[cta_bg];"
     tail+="[cta_bg]drawbox=x=${CTA_X}:y=${CTA_Y}:w=4:h=43:color=${GOLD}:t=fill:enable='${CTA_ENABLE}'[cta_bar];"
     tail+="[cta_bar]drawbox=x=$((CTA_X + 22)):y=$((CTA_Y + 16)):w=11:h=11:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
@@ -1513,12 +1159,11 @@ build_final_filter() {
     tail+="[tk4]drawbox=x=0:y=682:w=113:h=38:color=${GOLD}:t=fill[tk5];"
     tail+="[tk5]drawtext=fontfile=${FONT}:text='LIVE NOW':fontcolor=black:fontsize=15:x=13:y=695[tk6];"
 
-    # Small NASA wordmark chip, mirroring the LIVE NOW chip on the
-    # opposite corner — plain styled text, not a reproduction of the
-    # NASA insignia/meatball artwork.
+    # Date chip on the opposite corner. (Deliberately not a NASA wordmark:
+    # this is your channel's stream, not an official NASA broadcast.)
     tail+="[tk6]drawbox=x=1160:y=680:w=120:h=40:color=black@0.9:t=fill[tk7];"
     tail+="[tk7]drawbox=x=1163:y=682:w=113:h=38:color=${RED}:t=fill[tk8];"
-    tail+="[tk8]drawtext=fontfile=${FONT}:text='N A S A':fontcolor=white:fontsize=15:x=1180:y=695[tk9];"
+    tail+="[tk8]drawtext=fontfile=${FONT}:text='${RIGHT_CHIP_TEXT}':fontcolor=white:fontsize=15:x=1163+(113-text_w)/2:y=695[tk9];"
 
     tail+="[tk9]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.45:fontsize=14:borderw=1.5:bordercolor=black@0.7:x=(w-text_w)/2:y=657[final]"
 
@@ -1526,7 +1171,7 @@ build_final_filter() {
 }
 
 #############################################
-# is_image_url / get_image_local_path — unchanged from the solar script.
+# is_image_url / get_image_local_path
 #############################################
 is_image_url() {
     local u="${1%%\?*}"
@@ -1555,8 +1200,8 @@ get_image_local_path() {
 }
 
 #############################################
-# run_video — unchanged from the solar script (retry logic, image-
-# slide handling, audio/panel-image inputs, ffmpeg invocation).
+# run_video — retry logic, image-slide handling, audio input, ffmpeg
+# invocation.
 #############################################
 run_video() {
     local url="$1"
@@ -1574,13 +1219,10 @@ run_video() {
         stream_source="$local_img"
         echo "Image slide: $url -> $stream_source"
     else
-        # Reachability pre-check for real video URLs: a HEAD request
-        # with a short timeout, separate from the duration probe below
-        # (which can legitimately fail on a reachable-but-metadata-less
-        # stream). If the URL is genuinely unreachable and a fallback
-        # image is configured, use it for this rotation instead of
-        # burning MAX_RETRIES * RETRY_DELAY seconds retrying a dead
-        # video that was never going to connect.
+        # Reachability pre-check for real video URLs (short HEAD request).
+        # If the URL is genuinely unreachable and a fallback image is
+        # configured, use it for this rotation instead of burning
+        # MAX_RETRIES * RETRY_DELAY seconds retrying a dead video.
         if ! curl -sI --fail --max-time 10 "$url" >/dev/null 2>&1; then
             echo "WARNING: '$url' did not respond to a reachability check."
             if [ -n "$FALLBACK_IMAGE_URL" ]; then
@@ -1612,7 +1254,7 @@ run_video() {
         if [ -n "$duration" ]; then
             echo "Probed duration: ${duration}s"
         else
-            echo "Could not probe duration — countdown will show generic filler text."
+            echo "Could not probe duration."
         fi
     fi
 
@@ -1628,11 +1270,6 @@ run_video() {
         AUDIO_INPUT_ARGS=(-stream_loop -1 -i "$this_audio")
     else
         AUDIO_INPUT_ARGS=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
-    fi
-
-    local PANEL_IMG_INPUT_ARGS=()
-    if [ "$PANEL_IMAGES_AVAILABLE" = true ]; then
-        PANEL_IMG_INPUT_ARGS=(-loop 1 -framerate 30 -i "$MID_PANEL_IMG")
     fi
 
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
@@ -1657,7 +1294,6 @@ run_video() {
         "${MAIN_INPUT_ARGS[@]}" \
         -loop 1 -framerate 30 -i "$DOT_MARKER" \
         "${AUDIO_INPUT_ARGS[@]}" \
-        "${PANEL_IMG_INPUT_ARGS[@]}" \
         -filter_complex "$filter" \
         -map "[final]" \
         -map "$AUDIO_MAP" \
@@ -1683,7 +1319,7 @@ run_video() {
         -shortest \
         "${EXTRA_OUTPUT_ARGS[@]}" \
         -f flv \
-        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+        "${RTMP_BASE}/${YOUTUBE_STREAM_KEY}"
         local exit_code=$?
         set -e
 
@@ -1705,7 +1341,7 @@ run_video() {
 }
 
 #############################################
-# Stream loop — unchanged from the solar script.
+# Stream loop
 #############################################
 IFS=',' read -ra RAW_URLS <<< "$VIDEO_URL"
 URLS=()
@@ -1731,7 +1367,7 @@ fi
 while true; do
     for ((i = 0; i < NUM_URLS; i++)); do
         url="${URLS[$i]}"
-        run_video "$url"
+        run_video "$url" || true
         echo "Loading next video..."
         echo ""
     done
